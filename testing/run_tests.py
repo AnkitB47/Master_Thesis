@@ -20,12 +20,18 @@ def main() -> None:
     parser.add_argument(
         "--steps",
         type=int,
-        default=50,
+        default=200,
         help="Number of time steps in the reactor simulation",
+    )
+    parser.add_argument(
+        "--tf",
+        type=float,
+        default=1.0,
+        help="Final time of the reactor simulation",
     )
     args = parser.parse_args()
     
-    full_pipeline(args.mechanism, args.out, steps=args.steps)
+    full_pipeline(args.mechanism, args.out, steps=args.steps, tf=args.tf)
     print(f"Pipeline complete. Results written to '{args.out}'.")
 
 

@@ -1,85 +1,46 @@
-# Master Thesis: Mechanism Reduction Toolkit
+# Mechanism Reduction with GA and GNN
 
-This project provides a Python implementation for reducing chemical reaction mechanisms using graph algorithms, metaheuristics, and neural networks.  It reproduces much of the functionality of the original MATLAB framework found in the `MECH` folder and integrates portions of Arnab's GA project.
+This repository implements an end-to-end pipeline for reducing chemical
+reaction mechanisms.  A genetic algorithm (GA) searches for a minimal set of
+species while a graph neural network (GNN) guides the initial population based
+on species importance.  Reactor simulations are performed with Cantera and the
+quality of a reduction is assessed using progress variables and ignition delay
+metrics.
 
-## Project Layout
-
-```
-/data               Example mechanism files
-/graphs             Exported graphs in GraphML
-/gnn                Graph neural network models
-/mechanism          Mechanism parsing and editing utilities
-/metaheuristics     GA, ABC, Bees and Branch-and-Bound algorithms
-/reactor            Reactor models using Cantera
-/testing            Command line testing scripts
-/visualizations     Plotting utilities
-/results            Output data and figures
-```
-
-## Example Usage
-
-Run the full testing pipeline:
-
-```bash
-python -m testing.run_tests --out results
-```
-
-By default the script uses ``data/gri30.yaml`` and 50 time steps.  Use ``--mechanism`` and ``--steps`` to override these defaults.  The
-command executes all metaheuristics, compares reduced mechanisms to the full one and stores metrics and plots in the ``results``
-folder.
-
-Example output files in ``results/``:
+## Running the Pipeline
 
 ```
-results/
-    metrics.csv
-    pv_error.csv
-    ignition_delay.csv
-    species_retained.csv
-    ga_fitness.csv
-    abc_fitness.csv
-    bees_fitness.csv
-    profiles.png / .pdf
-    convergence.png / .pdf
-    ignition_delay.png / .pdf
-    pv_error.png / .pdf
+python -m testing.run_tests --out results --steps 200 --tf 1.0
 ```
 
-Each CSV contains numeric data that can be imported into other tools for further analysis.
+The command loads the `data/gri30.yaml` mechanism, executes a batch reactor
+simulation and applies the GA reduction.  CSV files and plots are written to
+`results/`.  Additional debugging information is stored in
+`debug_fitness.csv` and generation-wise PV/temperature plots.
 
-The command accepts optional arguments:
+## Dependencies
 
-- ``--mechanism`` – path to the Cantera YAML mechanism (defaults to ``data/gri30.yaml``).
-- ``--out`` – directory where all plots and CSVs are written.
-- ``--steps`` – number of time steps in the reactor simulation.
+- [Cantera](https://cantera.org)
+- [NetworkX](https://networkx.org)
+- [torch_geometric](https://pytorch-geometric.readthedocs.io)
+- [Matplotlib](https://matplotlib.org)
 
-## Installation
-
-Required packages are listed below.  Install with `pip`:
+Install them with pip if necessary:
 
 ```
-pip install cantera numpy scipy pandas matplotlib networkx torch torch_geometric
+pip install cantera networkx torch torch_geometric matplotlib
 ```
 
-## Modules
+## Repository Layout
 
-- **mechanism** – parse CTI/CK mechanisms using Cantera and remove species/reactions.
-- **graph** – construct species–reaction graphs and export in GraphML format.
-- **reactor** – batch, piston and network reactor solvers and 1-D flames.
-- **progress_variable** – compute progress variables from reactor results.
-- **metrics** – distance metrics for comparing reactor runs.
-- **timescales** – basic timescale analysis.
-- **metaheuristics** – GA, ABC, Bees and Branch-and-Bound algorithms for mechanism reduction.
-- **gnn** – graph neural network models (GCN and GAT) for scoring species.
-- **testing** – scripts to run example simulations and measure reduction errors.
-
-## Thesis Pipeline
-1. Load a mechanism using `mechanism.Mechanism`.
-2. Build the species graph with `graph.construction.build_species_graph`.
-3. Run reactor simulations with modules from `reactor`.
-4. Compute progress variables and errors.
-5. Optimise species selection via GA, ABC, Bees or BnB metaheuristics.
-6. Optionally train a GNN model to predict species importance.
-7. Compute timescales and distance metrics for evaluation.
-
-All results and plots should be written into the `results` and `visualizations` folders.
+```
+data/               Example mechanism files and weights
+mechanism/          Mechanism parsing and editing utilities
+reactor/            Reactor models using Cantera
+progress_variable.py  Progress variable computation
+metrics.py          Error metrics and ignition delay
+metaheuristics/     Genetic algorithm implementation
+gnn/                Simple GNN models for species scoring
+testing/            CLI entry points and pipeline utilities
+visualizations/     Plotting helpers
+```
