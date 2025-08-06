@@ -25,7 +25,10 @@ def progress_variable(Y: np.ndarray, weights: Sequence[float]) -> np.ndarray:
     W = np.asarray(weights, dtype=float)
     if Y.shape[1] != W.size:
         raise ValueError("Weight length must match number of species")
-    return (Y * W[None, :]).sum(axis=1)
+    pv = (Y * W[None, :]).sum(axis=1)
+    if pv[-1] <= pv[0]:
+        pv[-1] = pv[0] + 1e-6
+    return pv
 
 
 def optimise_weights(
