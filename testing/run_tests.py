@@ -34,6 +34,9 @@ def main():
     parser.add_argument("--T-plasma-out", type=float, default=None, help="Target temperature after plasma zone [K]")
     parser.add_argument("--radical-seed", default=None, help="Comma-separated radicals (e.g. H:0.01,OH:0.005)")
     parser.add_argument("--envelopes", default="envelopes.json", help="Envelope specification file")
+    parser.add_argument("--train-cases", default="auto", help="Training case specification or 'auto'")
+    parser.add_argument("--train-weights", default=None, help="Comma list or named weights for training cases")
+    parser.add_argument("--topn-species", type=int, default=6, help="Top-N species for axial overlays")
 
     # === NEW ARGUMENTS for label building and aggressiveness ===
     parser.add_argument("--alpha", type=float, default=0.8, help="Weight between LOO and flux importance")
@@ -124,6 +127,9 @@ def main():
         T_plasma_out=args.T_plasma_out,
         radical_seed=seed_dict,
         envelopes_path=args.envelopes,
+        train_cases=args.train_cases,
+        train_weights=args.train_weights,
+        topn_species=args.topn_species,
     )
     print(f"\n✅ Pipeline complete. Results written to '{args.out}'\n")
 

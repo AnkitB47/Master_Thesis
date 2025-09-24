@@ -528,6 +528,213 @@ def evaluate_selection(
     return float(fitness), *info
 
 
+def evaluate_selection_multi(
+    selection,
+    base_mech,
+    weights,
+    critical_idxs,
+    runner,
+    training_data: Sequence[dict],
+    *,
+    fitness_mode: str = "threshold",
+    tol_pv: float = 0.05,
+    tol_delay: float = 0.05,
+    tol_timescale: float = 0.05,
+    tol_resid: float = 0.05,
+    target_species: int | None = None,
+    zeta: float = 20.0,
+    details: list[dict] | None = None,
+):
+    if critical_idxs and (selection.sum() < max(4, len(critical_idxs)) or np.any(selection[critical_idxs] == 0)):
+        info = (1.0, 1.0, 0.0, 0.0, 0.0, 0.0, "missing_critical", int(selection.sum()), 0.0, 0.0, 0.0)
+        return -1e6, *info
+
+    mech = Mechanism(base_mech.file_path)
+    keep = [base_mech.species_names[i] for i, bit in enumerate(selection) if bit]
+    remove = [s for s in mech.species_names if s not in keep]
+    if remove:
+        mech.remove_species(remove)
+
+    if not training_data:
+        info = (1.0, 1.0, 0.0, 0.0, 0.0, 0.0, "no_training_cases", int(selection.sum()), 0.0, 0.0, 0.0)
+        return -1e6, *info
+
+    case_results: list[dict] = []
+    tol_vec = (
+        max(tol_pv, 1e-12),
+        max(tol_delay, 1e-12),
+        max(tol_timescale, 1e-12),
+        max(tol_resid, 1e-12),
+    )
+
+    for entry in training_data:
+        weight = float(entry.get("weight", 1.0))
+        full_case = entry.get("full")
+        if full_case is None:
+            continue
+        Y_case = entry.get("Y0")
+        T_case = float(entry.get("T0", 0.0))
+        p_case = float(entry.get("p", 0.0))
+        time_grid = getattr(full_case, "time", None)
+        steps_case = int(entry.get("steps", max(len(time_grid) - 1, 1))) if time_grid is not None else max(int(entry.get("steps", 0)), 1)
+
+        try:
+            red_case = runner(
+                mech.solution,
+                T_case,
+                p_case,
+                Y_case,
+                float(time_grid[-1]) if time_grid is not None else 1.0,
+                nsteps=steps_case,
+                use_mole=False,
+                time_grid=time_grid,
+            )
+        except RuntimeError as e:
+            reason = f"sim_failed:{entry.get('id', '?')}:{e}" if "no_reaction" not in str(e) else "no_reaction"
+            info = (1.0, 1.0, 0.0, 0.0, 0.0, 0.0, reason, int(selection.sum()), 0.0, 0.0, 0.0)
+            return -1e6, *info
+        except Exception as e:  # pragma: no cover - defensive
+            info = (1.0, 1.0, 0.0, 0.0, 0.0, 0.0, f"sim_failed:{type(e).__name__}", int(selection.sum()), 0.0, 0.0, 0.0)
+            return -1e6, *info
+
+        metrics = _compute_case_metrics(
+            full_case,
+            red_case,
+            base_mech.species_names,
+            mech.species_names,
+            weights,
+            tol_pv,
+            tol_delay,
+            tol_timescale,
+            tol_resid,
+        )
+
+        delta_T = float(red_case.temperature[-1] - red_case.temperature[0])
+        delta_Y = float(
+            np.max(np.abs(red_case.mass_fractions[-1] - red_case.mass_fractions[0]))
+        )
+        ratios = (
+            metrics["pv_err"] / tol_vec[0],
+            metrics["delay_metric"] / tol_vec[1],
+            metrics["tau_mis"] / tol_vec[2],
+            metrics["pen_species"] / tol_vec[3],
+        )
+
+        case_results.append(
+            {
+                "id": entry.get("id", "case"),
+                "application": entry.get("application", ""),
+                "weight": weight,
+                "metrics": metrics,
+                "ratios": ratios,
+                "delta_T": delta_T,
+                "delta_Y": delta_Y,
+                "delay_red": metrics.get("delay_red", 0.0),
+            }
+        )
+
+        if details is not None:
+            details.append(
+                {
+                    "case_id": entry.get("id", "case"),
+                    "application": entry.get("application", ""),
+                    "weight": weight,
+                    "pv_err": float(metrics["pv_err"]),
+                    "delay_metric": float(metrics["delay_metric"]),
+                    "tau_mis": float(metrics["tau_mis"]),
+                    "pen_species": float(metrics["pen_species"]),
+                    "ign_shift": float(metrics["ign_shift"]),
+                    "passes": bool(metrics["passes"]),
+                    "ratio_pv": float(ratios[0]),
+                    "ratio_delay": float(ratios[1]),
+                    "ratio_timescale": float(ratios[2]),
+                    "ratio_resid": float(ratios[3]),
+                }
+            )
+
+    if not case_results:
+        info = (1.0, 1.0, 0.0, 0.0, 0.0, 0.0, "no_training_cases", int(selection.sum()), 0.0, 0.0, 0.0)
+        return -1e6, *info
+
+    weights_arr = np.array([max(cr["weight"], 0.0) for cr in case_results], dtype=float)
+    weights_arr = np.where(weights_arr <= 0, 1.0, weights_arr)
+    wsum = float(weights_arr.sum())
+    if wsum <= 0.0:
+        wsum = float(len(case_results))
+
+    def _wavg(key: str) -> float:
+        return float(
+            sum(cr["weight"] * cr["metrics"][key] for cr in case_results) / wsum
+        )
+
+    pv_avg = _wavg("pv_err")
+    delay_avg = _wavg("delay_metric")
+    tau_avg = _wavg("tau_mis")
+    pen_avg = _wavg("pen_species")
+    ign_avg = _wavg("ign_shift")
+    delta_T_avg = float(sum(cr["weight"] * cr["delta_T"] for cr in case_results) / wsum)
+    delta_Y_avg = float(sum(cr["weight"] * cr["delta_Y"] for cr in case_results) / wsum)
+    delay_red_avg = float(sum(cr["weight"] * cr["delay_red"] for cr in case_results) / wsum)
+
+    ratios_avg = (
+        pv_avg / tol_vec[0],
+        delay_avg / tol_vec[1],
+        tau_avg / tol_vec[2],
+        pen_avg / tol_vec[3],
+    )
+    ratios_max = [max(cr["ratios"][i] for cr in case_results) for i in range(4)]
+    ratios = tuple(max(avg, rmax) for avg, rmax in zip(ratios_avg, ratios_max))
+
+    keep_cnt = int(selection.sum())
+    size_frac = keep_cnt / len(selection)
+    size_pen = 3.0 * max(0.0, size_frac - 0.4)
+    if target_species is not None:
+        qpen = ((keep_cnt - target_species) / len(selection)) ** 2
+        size_pen += 3.0 * qpen
+
+    fails = [cr["id"] for cr in case_results if not cr["metrics"]["passes"]]
+    exceed = [max(0.0, r - 1.0) for r in ratios]
+    reason = ""
+
+    if fitness_mode == "threshold":
+        if any(exceed) or fails:
+            reason = "threshold_fail"
+            if fails:
+                reason += ":" + ",".join(map(str, fails))
+            fitness = -1e6 * (sum(exceed) + (1.0 if fails else 0.0)) - size_pen
+        else:
+            margin = sum(1.0 - r for r in ratios)
+            fitness = 100.0 + margin - size_pen - 0.1 * tau_avg
+    else:
+        fitness = -(pv_avg + 12.0 * delay_avg + tau_avg + zeta * pen_avg + size_pen)
+
+    info = (
+        float(pv_avg),
+        float(delay_avg),
+        float(size_pen),
+        float(tau_avg),
+        float(pen_avg),
+        float(ign_avg),
+        reason,
+        keep_cnt,
+        float(delta_T_avg),
+        float(delta_Y_avg),
+        float(delay_red_avg),
+    )
+
+    logger.info(
+        "Multi-case fitness=%.3e pv=%.3e delay=%.3e tau=%.3e pen=%.3e size_pen=%.3e", 
+        fitness,
+        pv_avg,
+        delay_avg,
+        tau_avg,
+        pen_avg,
+        size_pen,
+    )
+
+    return float(fitness), *info
+
+
 # -------------------------------
 # GA driver
 # -------------------------------
@@ -557,6 +764,7 @@ def run_ga_reduction(
     tol_delay: float = 0.05,
     tol_timescale: float = 0.05,
     tol_resid: float = 0.05,
+    training_data: Sequence[dict] | None = None,
     mode: str = "0d",
     out_dir: str = "results",
 ):
@@ -706,30 +914,46 @@ def run_ga_reduction(
         individual[flips] ^= 1
         init_pop[i] = individual
 
-    eval_fn = lambda sel: evaluate_selection(
-        sel,
-        mech,
-        Y0,
-        tf,
-        full,
-        weights,
-        critical_idxs,
-        T0,
-        p0,
-        len(full.time) - 1,
-        log_times,
-        runner,
-        delay_full,
-        tau_pv_full,
-        tau_spts_full,
-        target_species,
-        fitness_mode,
-        tol_pv,
-        tol_delay,
-        tol_timescale,
-        tol_resid,
-        mode,
-    )
+    if mode == "1d" and training_data:
+        eval_fn = lambda sel: evaluate_selection_multi(
+            sel,
+            mech,
+            weights,
+            critical_idxs,
+            runner,
+            training_data,
+            fitness_mode=fitness_mode,
+            tol_pv=tol_pv,
+            tol_delay=tol_delay,
+            tol_timescale=tol_timescale,
+            tol_resid=tol_resid,
+            target_species=target_species,
+        )
+    else:
+        eval_fn = lambda sel: evaluate_selection(
+            sel,
+            mech,
+            Y0,
+            tf,
+            full,
+            weights,
+            critical_idxs,
+            T0,
+            p0,
+            len(full.time) - 1,
+            log_times,
+            runner,
+            delay_full,
+            tau_pv_full,
+            tau_spts_full,
+            target_species,
+            fitness_mode,
+            tol_pv,
+            tol_delay,
+            tol_timescale,
+            tol_resid,
+            mode,
+        )
 
     ms = min_species or (len(critical_idxs) + 5)
     M = max_species or max(ms + 5, int(0.6 * genome_len))
@@ -885,6 +1109,128 @@ def _two_point_cases(name: str, env: dict) -> list[dict]:
         },
     ]
     return cases
+
+
+def _load_training_cases_from_file(path: str) -> list[dict]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Training case file '{path}' not found")
+
+    ext = os.path.splitext(path)[1].lower()
+    entries: list[dict]
+    if ext == ".json":
+        with open(path) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            entries = list(data.get("cases", []))
+        elif isinstance(data, list):
+            entries = list(data)
+        else:
+            raise ValueError("Training case JSON must be a list or contain a 'cases' list")
+    else:
+        entries = []
+        with open(path) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                entries.append(row)
+
+    cases: list[dict] = []
+
+    def _parse_float(val, fallback=None):
+        if val is None or val == "":
+            return fallback
+        try:
+            return float(val)
+        except Exception as exc:  # pragma: no cover - defensive
+            raise ValueError(f"Invalid float value '{val}' in training case file") from exc
+
+    for idx, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        case = dict(entry)
+        case_id = case.get("id") or f"train_case_{idx:02d}"
+        application = str(case.get("application", "POX"))
+        phi = _parse_float(case.get("phi"))
+        T0 = _parse_float(case.get("T0"))
+        p = case.get("p")
+        if p is None:
+            p = case.get("p_pa")
+        if p is None and case.get("p_bar") is not None:
+            p = _parse_float(case.get("p_bar"))
+            if p is not None:
+                p *= 1e5
+        else:
+            p = _parse_float(p)
+
+        if phi is None or T0 is None or p is None:
+            raise ValueError(f"Training case '{case_id}' missing phi/T0/p")
+
+        dil = case.get("diluents", [])
+        if isinstance(dil, str):
+            try:
+                dil = json.loads(dil)
+            except json.JSONDecodeError:
+                dil = []
+        if not isinstance(dil, list):
+            dil = []
+
+        ratio = case.get("co2_ch4_ratio")
+        ratio_val = _parse_float(ratio) if ratio is not None else None
+
+        use_seed_raw = case.get("use_seed", False)
+        if isinstance(use_seed_raw, str):
+            use_seed = use_seed_raw.strip().lower() in {"1", "true", "yes"}
+        else:
+            use_seed = bool(use_seed_raw)
+
+        cases.append(
+            {
+                "id": str(case_id),
+                "application": application,
+                "phi": float(phi),
+                "T0": float(T0),
+                "p": float(p),
+                "diluents": dil,
+                "co2_ch4_ratio": ratio_val,
+                "use_seed": use_seed,
+            }
+        )
+
+    return cases
+
+
+def _parse_train_weights(spec: str | None, cases: list[dict]) -> list[float]:
+    if not cases:
+        return []
+    if spec is None or spec.strip().lower() in {"", "auto"}:
+        return [1.0] * len(cases)
+
+    tokens = [tok.strip() for tok in spec.split(",") if tok.strip()]
+    if not tokens:
+        return [1.0] * len(cases)
+
+    if all("=" in tok for tok in tokens):
+        mapping = {}
+        for tok in tokens:
+            key, val = tok.split("=", 1)
+            mapping[key.strip().lower()] = float(val)
+
+        def _group(case: dict) -> str:
+            app = str(case.get("application", "")).lower()
+            if app in {"hp_pox", "hp-pox"}:
+                return "hp_pox"
+            if app in {"co2_recycle", "co2-recycle", "co2"}:
+                return "co2"
+            if app == "plasma":
+                return "plasma"
+            return "pox"
+
+        return [float(mapping.get(_group(case), 1.0)) for case in cases]
+
+    if len(tokens) != len(cases):
+        raise ValueError(
+            "Number of training weights must match training cases or provide named groups"
+        )
+    return [float(tok) for tok in tokens]
 
 
 # at top of testing/pipeline.py (imports section), make sure this exists:
@@ -1531,6 +1877,9 @@ def _full_pipeline_pfr(
     T_plasma_out: float | None,
     radical_seed: Dict[str, float] | None,
     envelopes_path: str,
+    train_cases: str = "auto",
+    train_weights: str | None = None,
+    topn_species: int = 6,
 ):
     mech = Mechanism(mech_path)
     envelopes = _load_envelopes(envelopes_path)
@@ -1580,6 +1929,115 @@ def _full_pipeline_pfr(
         steps_short = max(50, max(steps_effective // 2, 10))
     config.max_residence_time = max(config.max_residence_time or 0.0, 1.5 * tf_total)
 
+    if isinstance(train_cases, str) and train_cases.lower() == "auto":
+        ratio = pox_env.get("CO2_CH4_ratio") or {}
+        ratio_nom = None
+        if isinstance(ratio, dict) and ratio.get("nominal") is not None:
+            try:
+                ratio_nom = float(ratio.get("nominal"))
+            except Exception:
+                ratio_nom = None
+        auto_cases: list[dict] = [
+            {
+                "id": "pox_nominal",
+                "application": "POX",
+                "phi": phi_base,
+                "T0": T0_base,
+                "p": p0_base,
+                "diluents": pox_env.get("diluents", []),
+                "co2_ch4_ratio": ratio_nom,
+                "use_seed": False,
+            }
+        ]
+        for name in ("POX", "HP_POX", "CO2_recycle", "PLASMA"):
+            env = envelopes.get(name)
+            if not env:
+                continue
+            for case in _two_point_cases(name, env):
+                spec = dict(case)
+                spec.setdefault("diluents", env.get("diluents", []))
+                spec.setdefault("use_seed", name == "PLASMA")
+                auto_cases.append(spec)
+        train_specs = auto_cases
+    else:
+        train_specs = _load_training_cases_from_file(train_cases)
+
+    if not train_specs:
+        train_specs = [
+            {
+                "id": "pox_nominal",
+                "application": "POX",
+                "phi": phi_base,
+                "T0": T0_base,
+                "p": p0_base,
+                "diluents": pox_env.get("diluents", []),
+                "co2_ch4_ratio": None,
+                "use_seed": False,
+            }
+        ]
+
+    weight_specs = _parse_train_weights(train_weights, train_specs)
+    if len(weight_specs) != len(train_specs):
+        raise ValueError("Training weights must match number of training cases")
+
+    training_data: list[dict] = []
+    training_lookup: dict[str, dict] = {}
+
+    for spec, weight in zip(train_specs, weight_specs):
+        case_id = str(spec.get("id", f"case_{len(training_data)}"))
+        use_seed = bool(spec.get("use_seed", False))
+        seed = seed_dict if use_seed and seed_dict else None
+
+        if (
+            abs(float(spec.get("phi", phi_base)) - phi_base) < 1e-9
+            and abs(float(spec.get("T0", T0_base)) - T0_base) < 1e-6
+            and abs(float(spec.get("p", p0_base)) - p0_base) < 1.0
+        ):
+            Y_case = dict(Y0)
+            full_case = base_res
+        else:
+            Y_case = _compose_feed(
+                mech.solution,
+                float(spec.get("phi", phi_base)),
+                diluent,
+                spec.get("diluents", []),
+                radical_seed=seed,
+                co2_ratio=spec.get("co2_ch4_ratio"),
+            )
+            full_case = runner(
+                mech.solution,
+                float(spec.get("T0", T0_base)),
+                float(spec.get("p", p0_base)),
+                Y_case,
+                tf_total,
+                nsteps=steps_effective,
+                use_mole=False,
+            )
+
+        delta_T_full = float(full_case.temperature[-1] - full_case.temperature[0])
+        delta_Y_full = float(
+            np.max(np.abs(full_case.mass_fractions[-1] - full_case.mass_fractions[0]))
+        )
+        if delta_T_full < 5.0 and delta_Y_full < 1e-6:
+            logger.warning("Skipping inert training case %s", case_id)
+            continue
+
+        entry = {
+            "id": case_id,
+            "application": spec.get("application", ""),
+            "weight": float(weight),
+            "Y0": dict(Y_case),
+            "T0": float(spec.get("T0", T0_base)),
+            "p": float(spec.get("p", p0_base)),
+            "full": full_case,
+            "steps": len(full_case.time) - 1,
+        }
+        training_data.append(entry)
+        training_lookup[case_id] = entry
+
+    if not training_data:
+        raise RuntimeError("No valid training cases available for 1D reduction")
+
     names, sols, hists, debug, full, weights = run_ga_reduction(
         mech_path,
         Y0,
@@ -1605,6 +2063,7 @@ def _full_pipeline_pfr(
         tol_delay=tol_delay,
         tol_timescale=tol_timescale,
         tol_resid=tol_resid,
+        training_data=training_data,
         mode="1d",
         out_dir=out_dir,
     )
@@ -1698,38 +2157,80 @@ def _full_pipeline_pfr(
         base_metrics["ign_shift"],
     )
 
+    critical = [
+        s
+        for s in [
+            "CH4",
+            "O2",
+            "N2",
+            "H2O",
+            "CO",
+            "CO2",
+            "OH",
+            "H",
+            "O",
+            "HO2",
+            "H2O2",
+            "H2",
+        ]
+        if s in mech.species_names
+    ]
+    critical_idxs = [mech.species_names.index(s) for s in critical]
+    train_details: list[dict] = []
+    evaluate_selection_multi(
+        sols[0],
+        mech,
+        weights,
+        critical_idxs,
+        runner,
+        training_data,
+        fitness_mode=fitness_mode,
+        tol_pv=tol_pv,
+        tol_delay=tol_delay,
+        tol_timescale=tol_timescale,
+        tol_resid=tol_resid,
+        target_species=target_species,
+        details=train_details,
+    )
+
     wp5_cases: list[dict] = []
     for name in ("POX", "HP_POX", "CO2_recycle"):
         if name in envelopes:
             wp5_cases.extend(_two_point_cases(name, envelopes[name]))
     plasma_cases = _two_point_cases("PLASMA", envelopes["PLASMA"]) if "PLASMA" in envelopes else []
 
-    profile_species = ["CH4", "CO", "H2", "CO2", "H2O", "O2"]
     profiles_rows: list[dict] = []
     kpi_rows: list[dict] = []
     robustness_wp5: list[dict] = []
     robustness_plasma: list[dict] = []
-    overlay_data: list[dict] = []
+    overlay_cases: list[dict] = []
 
     def _evaluate_case(case: dict, use_seed: bool) -> None:
-        seed = seed_dict if use_seed and seed_dict else None
-        Y_case = _compose_feed(
-            mech.solution,
-            case["phi"],
-            diluent,
-            case.get("diluents", []),
-            radical_seed=seed,
-            co2_ratio=case.get("co2_ch4_ratio"),
-        )
-        full_case = runner(
-            mech.solution,
-            case["T0"],
-            case["p"],
-            Y_case,
-            tf_total,
-            nsteps=steps_effective,
-            use_mole=False,
-        )
+        case_id = str(case["id"])
+        cached = training_lookup.get(case_id)
+        if cached is not None:
+            Y_case = dict(cached["Y0"])
+            full_case = cached["full"]
+        else:
+            seed = seed_dict if use_seed and seed_dict else None
+            Y_case = _compose_feed(
+                mech.solution,
+                case["phi"],
+                diluent,
+                case.get("diluents", []),
+                radical_seed=seed,
+                co2_ratio=case.get("co2_ch4_ratio"),
+            )
+            full_case = runner(
+                mech.solution,
+                case["T0"],
+                case["p"],
+                Y_case,
+                tf_total,
+                nsteps=steps_effective,
+                use_mole=False,
+            )
+
         red_case = runner(
             red_mech.solution,
             case["T0"],
@@ -1802,39 +2303,73 @@ def _full_pipeline_pfr(
         else:
             robustness_wp5.append(entry)
 
-        overlay_species = {}
-        map_full = {s: i for i, s in enumerate(mech.species_names)}
-        map_red = {s: i for i, s in enumerate(red_mech.species_names)}
-        for sp in profile_species:
-            idx_f = map_full.get(sp)
-            idx_r = map_red.get(sp)
-            if idx_f is not None:
-                yf = full_case.mass_fractions[:, idx_f]
-            else:
-                yf = np.zeros_like(full_case.temperature)
-            if idx_r is not None:
-                yr = red_case.mass_fractions[:, idx_r]
-            else:
-                yr = np.zeros_like(red_case.temperature)
-            overlay_species[sp] = (yf, yr)
-
-        overlay_data.append(
+        overlay_cases.append(
             {
-                "id": case["id"],
+                "id": case_id,
                 "application": case["application"],
-                "x": full_case.x,
-                "T_full": full_case.temperature,
-                "T_red": red_case.temperature,
+                "full": full_case,
+                "red": red_case,
                 "ign_full": ign_full,
                 "ign_red": ign_red,
-                "species": overlay_species,
             }
         )
 
+    for case in wp5_cases:
+        _evaluate_case(case, use_seed=False)
+    for case in plasma_cases:
+        _evaluate_case(case, use_seed=True)
+
+    def _select_top_species(cases: list[dict], n: int) -> list[str]:
+        peaks: dict[str, float] = {}
+        for data in cases:
+            spec_map = data.get("species", {}) or {}
+            for name, series in spec_map.items():
+                full_vals = np.asarray(series[0], dtype=float)
+                if full_vals.size:
+                    peaks[name] = max(peaks.get(name, 0.0), float(np.nanmax(np.abs(full_vals))))
+        ranked = sorted(peaks.items(), key=lambda kv: kv[1], reverse=True)
+        return [name for name, _ in ranked[:n]]
+
+    plot_cases: list[dict] = []
+    for entry in overlay_cases:
+        full_case = entry["full"]
+        red_case = entry["red"]
+        map_full = {s: i for i, s in enumerate(full_case.species_names)}
+        map_red = {s: i for i, s in enumerate(red_case.species_names)}
+        species_map: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for sp, idx_f in map_full.items():
+            yf = full_case.mass_fractions[:, idx_f]
+            idx_r = map_red.get(sp)
+            yr = red_case.mass_fractions[:, idx_r] if idx_r is not None else np.zeros_like(yf)
+            species_map[sp] = (yf, yr)
+        entry["species"] = species_map
+        entry["x"] = full_case.x
+        entry["T_full"] = full_case.temperature
+        entry["T_red"] = red_case.temperature
+        plot_cases.append(
+            {
+                "id": entry["id"],
+                "application": entry["application"],
+                "x": entry["x"],
+                "T_full": entry["T_full"],
+                "T_red": entry["T_red"],
+                "ign_full": entry["ign_full"],
+                "ign_red": entry["ign_red"],
+                "species": species_map,
+            }
+        )
+
+    selected_species = _select_top_species(plot_cases, topn_species)
+    profiles_rows = []
+    for entry in overlay_cases:
+        full_case = entry["full"]
+        red_case = entry["red"]
+        map_full = {s: i for i, s in enumerate(full_case.species_names)}
+        map_red = {s: i for i, s in enumerate(red_case.species_names)}
         for j, x_val in enumerate(full_case.x):
             row = {
-                "case_id": case["id"],
-                "application": case["application"],
+                "case_id": entry["id"],
+                "application": entry["application"],
                 "x": float(x_val),
                 "temperature_full": float(full_case.temperature[j]),
                 "temperature_red": float(red_case.temperature[j]),
@@ -1843,21 +2378,21 @@ def _full_pipeline_pfr(
                 "h2co_full": float(full_case.h2_co_ratio[j]),
                 "h2co_red": float(red_case.h2_co_ratio[j]),
             }
-            for sp in profile_species:
+            for sp in selected_species:
                 idx_f = map_full.get(sp)
                 idx_r = map_red.get(sp)
-                row[f"{sp}_full"] = float(full_case.mass_fractions[j, idx_f]) if idx_f is not None else 0.0
-                row[f"{sp}_red"] = float(red_case.mass_fractions[j, idx_r]) if idx_r is not None else 0.0
+                row[f"{sp}_full"] = (
+                    float(full_case.mass_fractions[j, idx_f]) if idx_f is not None else 0.0
+                )
+                row[f"{sp}_red"] = (
+                    float(red_case.mass_fractions[j, idx_r]) if idx_r is not None else 0.0
+                )
             profiles_rows.append(row)
 
-    for case in wp5_cases:
-        _evaluate_case(case, use_seed=False)
-    for case in plasma_cases:
-        _evaluate_case(case, use_seed=True)
-
     with open(os.path.join(out_dir, "pfr_profiles.csv"), "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=profiles_rows[0].keys()) if profiles_rows else None
-        if writer:
+        if profiles_rows:
+            fieldnames = list(profiles_rows[0].keys())
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for row in profiles_rows:
                 writer.writerow(row)
@@ -1867,6 +2402,14 @@ def _full_pipeline_pfr(
         if writer:
             writer.writeheader()
             for row in kpi_rows:
+                writer.writerow(row)
+
+    with open(os.path.join(out_dir, "train_summary.csv"), "w", newline="") as f:
+        if train_details:
+            fieldnames = list(train_details[0].keys())
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in train_details:
                 writer.writerow(row)
 
     if robustness_wp5:
@@ -1896,7 +2439,7 @@ def _full_pipeline_pfr(
         df_kpi.to_latex(os.path.join(latex_dir, "kpi_summary.tex"), index=False, float_format="%.3f")
 
     viz_dir = os.path.join(out_dir, "visualizations")
-    plot_axial_overlays(overlay_data, profile_species, os.path.join(viz_dir, "axial_overlay"))
+    plot_axial_overlays(plot_cases, None, os.path.join(viz_dir, "axial_overlay"), topn=topn_species)
     plot_kpi_bars(df_kpi, os.path.join(viz_dir, "kpi_bars"))
     plot_consistency_stub(df_kpi, os.path.join(viz_dir, "consistency"), baseline=None)
 
@@ -1944,6 +2487,9 @@ def full_pipeline(
     T_plasma_out: float | None = None,
     radical_seed: Dict[str, float] | None = None,
     envelopes_path: str = "envelopes.json",
+    train_cases: str = "auto",
+    train_weights: str | None = None,
+    topn_species: int = 6,
 ) -> None:
     if mode == "1d":
         _full_pipeline_pfr(
@@ -1964,22 +2510,25 @@ def full_pipeline(
             generations=generations,
             population=population,
             mutation=mutation,
-            fitness_mode=fitness_mode,
-            tol_pv=tol_pv,
-            tol_delay=tol_delay,
-            tol_timescale=tol_timescale,
-            tol_resid=tol_resid,
-            diluent=diluent,
-            L=L,
-            D=D,
-            mdot=mdot,
-            U=U,
-            Tw=Tw,
-            plasma_length=plasma_length,
-            T_plasma_out=T_plasma_out,
-            radical_seed=radical_seed,
-            envelopes_path=envelopes_path,
-        )
+        fitness_mode=fitness_mode,
+        tol_pv=tol_pv,
+        tol_delay=tol_delay,
+        tol_timescale=tol_timescale,
+        tol_resid=tol_resid,
+        diluent=diluent,
+        L=L,
+        D=D,
+        mdot=mdot,
+        U=U,
+        Tw=Tw,
+        plasma_length=plasma_length,
+        T_plasma_out=T_plasma_out,
+        radical_seed=radical_seed,
+        envelopes_path=envelopes_path,
+        train_cases=train_cases,
+        train_weights=train_weights,
+        topn_species=topn_species,
+    )
     else:
         _full_pipeline_batch(
             mech_path,
