@@ -319,8 +319,16 @@ def plot_axial_overlays(cases: Sequence[dict], species: Sequence[str], out_base:
         x = np.asarray(data.get("x", []), dtype=float)
         if x.size == 0:
             continue
-        axes[0].plot(x, data.get("T_full", []), label=f"{data['id']} full")
-        axes[0].plot(x, data.get("T_red", []), linestyle="--", label=f"{data['id']} red")
+        xu, idx = np.unique(x, return_index=True)
+        T_full = np.asarray(data.get("T_full", []), dtype=float)
+        T_red = np.asarray(data.get("T_red", []), dtype=float)
+        valid = (idx < T_full.size) & (idx < T_red.size)
+        if not np.any(valid):
+            continue
+        idx_valid = idx[valid]
+        xu_valid = xu[valid]
+        axes[0].plot(xu_valid, T_full[idx_valid], label=f"{data['id']} full")
+        axes[0].plot(xu_valid, T_red[idx_valid], linestyle="--", label=f"{data['id']} red")
         axes[0].axvline(data.get("ign_full", np.nan), color="0.6", ls=":", alpha=0.5)
         axes[0].axvline(data.get("ign_red", np.nan), color="0.3", ls="--", alpha=0.5)
 
@@ -336,8 +344,32 @@ def plot_axial_overlays(cases: Sequence[dict], species: Sequence[str], out_base:
             spec = data.get("species", {}).get(sp)
             if not spec:
                 continue
-            axes[1].plot(data["x"], spec[0], color=color, alpha=0.8, label=f"{sp} {data['id']} full")
-            axes[1].plot(data["x"], spec[1], color=color, linestyle="--", alpha=0.6, label=f"{sp} {data['id']} red")
+            x = np.asarray(data.get("x", []), dtype=float)
+            if x.size == 0:
+                continue
+            xu, idx = np.unique(x, return_index=True)
+            full_arr = np.asarray(spec[0], dtype=float)
+            red_arr = np.asarray(spec[1], dtype=float)
+            valid = (idx < full_arr.size) & (idx < red_arr.size)
+            if not np.any(valid):
+                continue
+            idx_valid = idx[valid]
+            xu_valid = xu[valid]
+            axes[1].plot(
+                xu_valid,
+                full_arr[idx_valid],
+                color=color,
+                alpha=0.8,
+                label=f"{sp} {data['id']} full",
+            )
+            axes[1].plot(
+                xu_valid,
+                red_arr[idx_valid],
+                color=color,
+                linestyle="--",
+                alpha=0.6,
+                label=f"{sp} {data['id']} red",
+            )
 
     axes[1].set_xlabel("Axial coordinate [m]")
     axes[1].set_ylabel("Mass fraction")

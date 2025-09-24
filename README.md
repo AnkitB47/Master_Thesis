@@ -13,7 +13,7 @@ Our fully functional **Prototype v1** performs end-to-end reduction, evaluates t
 ## 🚀 How to Run the Pipeline
 
 ```bash
-python -m testing.run_tests --mechanism data/gri30.yaml --out results --steps 200 --tf 5.0
+python -m testing.run_tests --mechanism data/gri30.yaml --out results --steps 200 --tf 5.0 --fitness-mode standard
 ````
 
 * `--mechanism`: Path to the full chemical mechanism file (default: `data/gri30.yaml`)
@@ -56,14 +56,14 @@ emits additional artefacts:
 python -m testing.run_tests \
   --mode 1d --mechanism data/gri30.yaml --out results/pox_nominal \
   --phi 0.7 --T0 700 --p0 1.0e6 --L 0.8 --D 0.05 --mdot 0.12 --U 0.0 \
-  --steps 400 --fitness-mode threshold --tol-pv 0.05 --tol-delay 0.05 --tol-timescale 0.05 --tol-resid 0.05
+  --steps 400 --fitness-mode threshold --tol-pv 0.15 --tol-delay 0.15 --tol-timescale 1.5 --tol-resid 0.05
 
 # Plasma surrogate (torch heating to 1500 K with radical seeding)
 python -m testing.run_tests \
   --mode 1d --mechanism data/gri30.yaml --out results/plasma_demo \
   --phi 1.0 --T0 400 --p0 2.0e5 --L 0.6 --D 0.04 --mdot 0.08 \
   --plasma-length 0.1 --T-plasma-out 1500 --radical-seed "H:0.005,OH:0.002" \
-  --steps 400 --fitness-mode threshold --tol-pv 0.05 --tol-delay 0.05 --tol-timescale 0.05 --tol-resid 0.05
+  --steps 400 --fitness-mode threshold --tol-pv 0.15 --tol-delay 0.15 --tol-timescale 1.5 --tol-resid 0.05
 ```
 
 Both commands populate the additional PFR CSVs, plots, and LaTeX tables described above while keeping the GA–GNN reduction

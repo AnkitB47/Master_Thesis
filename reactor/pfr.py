@@ -192,12 +192,26 @@ def _postprocess_result(
         mass_fractions = mass_fractions[keep]
         tau = tau[keep]
 
-    # safe gradient
-    if len(x) >= 3 and (x[-1] - x[0]) > 0:
-        try:
-            dTdx = np.gradient(temperature, x, edge_order=2)
-        except Exception:
-            dTdx = np.gradient(temperature, edge_order=2)
+    if len(x) >= 2:
+        # ensure strictly increasing x before gradient
+        x = np.asarray(x, dtype=float)
+        eps = 1e-12
+        x_mono = x.copy()
+        for i in range(1, len(x_mono)):
+            if x_mono[i] <= x_mono[i - 1]:
+                x_mono[i] = x_mono[i - 1] + eps
+
+        # robust gradient: avoid zero dx near ignition kinks
+        dT = np.gradient(temperature)
+        dx = np.empty_like(x_mono)
+        if len(x_mono) > 2:
+            dx[1:-1] = 0.5 * (x_mono[2:] - x_mono[:-2])
+        if len(x_mono) >= 2:
+            dx[0] = x_mono[1] - x_mono[0]
+            dx[-1] = x_mono[-1] - x_mono[-2]
+        dx = np.where(np.abs(dx) < eps, np.sign(dx) * eps + (dx == 0) * eps, dx)
+        dTdx = dT / dx
+        x = x_mono
     else:
         dTdx = np.zeros_like(x)
 
