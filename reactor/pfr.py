@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, Optional
+from typing import Callable, Dict, Iterable, Literal, Optional
 
 import cantera as ct
 import numpy as np
 from scipy.integrate import solve_ivp
+from scipy import sparse
 
 
 @dataclass
@@ -26,6 +27,12 @@ class PFRConfig:
     max_residence_time: Optional[float] = None
     plasma_length: float = 0.0
     plasma_temperature: Optional[float] = None
+    solver: Literal["Radau", "BDF"] = "Radau"
+    rtol: float = 1e-6
+    atol: float = 1e-12
+    first_step: float | None = 1e-7
+    max_step_cap: float | None = 5e-4
+    jac_sparsity: bool = True
 
     # internal fields initialised later
     _area: float = field(init=False, repr=False)
@@ -75,6 +82,33 @@ def _mass_to_mole(Y: np.ndarray, molecular_weights: np.ndarray) -> np.ndarray:
     denom = np.sum(Y / molecular_weights[None, :], axis=1, keepdims=True)
     denom = np.where(denom <= 0, 1.0, denom)
     return (Y / molecular_weights[None, :]) / denom
+
+
+def _pfr_jac_sparsity(n_species: int) -> sparse.csr_matrix:
+    """Return a conservative sparsity pattern for the PFR Jacobian."""
+
+    n_state = n_species + 2  # temperature + species + axial position
+    rows = []
+    cols = []
+
+    # Dense temperature row (coupled to all states)
+    rows.extend([0] * n_state)
+    cols.extend(range(n_state))
+
+    # Species block as tri-diagonal (each species depends on itself and neighbours)
+    for i in range(n_species):
+        row = i + 1
+        for col in (i, i + 1, i + 2):
+            if 0 <= col < n_state:
+                rows.append(row)
+                cols.append(col)
+
+    # Axial position row depends weakly on density/temperature (safe dense row)
+    rows.extend([n_state - 1] * n_state)
+    cols.extend(range(n_state))
+
+    data = np.ones(len(rows), dtype=float)
+    return sparse.csr_matrix((data, (rows, cols)), shape=(n_state, n_state))
 
 
 @dataclass
@@ -336,16 +370,31 @@ def run_pfr(
     event.direction = 1  # type: ignore[attr-defined]
 
     points = int(n_points or config.n_points)
+    max_step_geom = t_end / max(points, 200)
+    if config.max_step_cap is not None:
+        max_step = min(max_step_geom, config.max_step_cap)
+    else:
+        max_step = max_step_geom
+
+    solver_kwargs = {
+        "method": config.solver,
+        "rtol": float(config.rtol),
+        "atol": float(config.atol),
+        "events": event,
+        "dense_output": False,
+        "max_step": max(max_step, 1e-12),
+    }
+
+    if config.first_step is not None:
+        solver_kwargs["first_step"] = float(max(config.first_step, 1e-12))
+    if config.jac_sparsity:
+        solver_kwargs["jac_sparsity"] = _pfr_jac_sparsity(len(Y_init))
+
     sol = solve_ivp(
         rhs,
         (0.0, t_end),
         state0,
-        method="BDF",
-        atol=1e-12,           # relaxed from 1e-18
-        rtol=1e-6,            # relaxed from 1e-8
-        events=event,
-        dense_output=False,
-        max_step=min(t_end / max(points, 200), 5e-3),  # hard cap
+        **solver_kwargs,
     )
 
     if sol.y.shape[1] < 2:

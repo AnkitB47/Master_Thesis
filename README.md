@@ -49,6 +49,12 @@ emits additional artefacts:
 * `visualizations/axial_overlay` & `visualizations/kpi_bars` – axial profile overlays (with ignition markers) and KPI bar charts
   across the envelope sweep.
 
+Extra CLI knobs for the 1D mode:
+
+* `--train-cases auto|path` – default multi-case GA training (nominal POX + envelope extremes) or explicit JSON/CSV cases.
+* `--train-weights` – comma-separated weights per case or per named group (`pox,hp_pox,co2,plasma`).
+* `--topn-species` – number of dominant species shown in axial overlays (default 6).
+
 ### Minimal 1D examples
 
 ```bash
@@ -67,7 +73,12 @@ python -m testing.run_tests \
 ```
 
 Both commands populate the additional PFR CSVs, plots, and LaTeX tables described above while keeping the GA–GNN reduction
-workflow consistent with the 0D baseline.
+workflow consistent with the 0D baseline. All reference runs are warning-free; use `verify_kpis.py` to double-check the final
+threshold metrics:
+
+```bash
+python verify_kpis.py  # checks results_1d_nominal/pfr_kpis.csv by default
+```
 
 ---
 
