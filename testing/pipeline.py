@@ -76,6 +76,24 @@ def _ensure_same_grid(time_ref: _np.ndarray,
     return out
 
 
+def _interp_to(ref_t, y_t, y_vals):
+    """Interpolate ``y_vals`` defined on ``y_t`` onto ``ref_t`` column-wise."""
+    ref_t = np.asarray(ref_t, dtype=float)
+    y_t = np.asarray(y_t, dtype=float)
+    y_vals = np.asarray(y_vals, dtype=float)
+    if y_vals.ndim == 1:
+        return np.interp(ref_t, y_t, y_vals)
+    out = np.zeros((len(ref_t), y_vals.shape[1]), dtype=float)
+    for j in range(y_vals.shape[1]):
+        out[:, j] = np.interp(ref_t, y_t, y_vals[:, j])
+    return out
+
+
+def _rms_norm(arr):
+    arr = np.asarray(arr, dtype=float)
+    return np.linalg.norm(arr) / max(1, np.sqrt(arr.size))
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -193,19 +211,21 @@ def _loo_scores(
             m.remove_species([s])
             red = _baseline_short_run(m, T0, p0, Y0, tf_short, steps_short, log_times, runner)
 
+            red_interp = _interp_to(baseline.time, red.time, red.mass_fractions)
             score = pv_error_aligned(
                 baseline.mass_fractions,
-                red.mass_fractions,
+                red_interp,
                 base_mech.species_names,
                 m.species_names,
                 W,
             )
 
             Y_red_interp = np.zeros_like(baseline.mass_fractions)
+            map_red = {name: idx for idx, name in enumerate(m.species_names)}
             for j, name in enumerate(base_mech.species_names):
-                if name in m.species_names:
-                    jr = m.species_names.index(name)
-                    Y_red_interp[:, j] = np.interp(baseline.time, red.time, red.mass_fractions[:, jr])
+                idx = map_red.get(name)
+                if idx is not None:
+                    Y_red_interp[:, j] = red_interp[:, idx]
 
             diff = np.abs(baseline.mass_fractions[mask_post] - Y_red_interp[mask_post])
             resid_val = float(
@@ -380,16 +400,15 @@ def evaluate_selection(
         break
 
     # interpolate reduced onto full time grid for penalties
-    Y_red_interp = np.zeros((len(full_res.time), len(mech.species_names)))
-    for j, s in enumerate(mech.species_names):
-        Y_red_interp[:, j] = np.interp(full_res.time, res.time, res.mass_fractions[:, j])
+    Y_red_interp = _interp_to(full_res.time, res.time, res.mass_fractions)
+    weights_arr = np.asarray(weights, dtype=float)
 
     err = pv_error_aligned(
         full_res.mass_fractions,
         Y_red_interp,
         base_mech.species_names,
         mech.species_names,
-        np.asarray(weights),
+        weights_arr,
     )
     delay_red, _ = ignition_delay(res.time, res.temperature)
     delay_diff = abs(delay_red - tau_full) / max(tau_full, 1e-12)
@@ -415,46 +434,46 @@ def evaluate_selection(
     _, tau_pv_red = pv_timescale(res.time, res.mass_fractions, mech.species_names)
     tau_spts_red = spts(res.time, res.mass_fractions)
 
-    # Align both PVTS and SPTS to the full reference grid
-    (pv_full_ref, pv_red_ref), (spts_full_ref, spts_red_ref) = _ensure_same_grid(
-        full_res.time,
-        [
-            (full_res.time, tau_pv_full, res.time, tau_pv_red),
-            (full_res.time, tau_spts_full, res.time, tau_spts_red),
-        ],
-    )
+    log_full_pv = np.log10(tau_pv_full + 1e-30)
+    log_red_pv = _interp_to(full_res.time, res.time, np.log10(tau_pv_red + 1e-30))
+    log_full_spts = np.log10(tau_spts_full + 1e-30)
+    log_red_spts = _interp_to(full_res.time, res.time, np.log10(tau_spts_red + 1e-30))
 
-    log_full_pv = np.log10(pv_full_ref + 1e-30)
-    log_red_pv = np.log10(pv_red_ref + 1e-30)
-    log_full_spts = np.log10(spts_full_ref + 1e-30)
-    log_red_spts = np.log10(spts_red_ref + 1e-30)
-
-    tau_mis = np.linalg.norm(log_full_pv - log_red_pv) + np.linalg.norm(log_full_spts - log_red_spts)
+    tau_mis = _rms_norm(log_full_pv - log_red_pv) + _rms_norm(log_full_spts - log_red_spts)
 
     # post-ignition species penalty
     map_full = {s: i for i, s in enumerate(base_mech.species_names)}
     map_red = {s: i for i, s in enumerate(mech.species_names)}
     Y_red_full = np.zeros_like(full_res.mass_fractions)
-    for s, j in map_full.items():
-        if s in map_red:
-            Y_red_full[:, j] = Y_red_interp[:, map_red[s]]
+    for s, idx_full in map_full.items():
+        idx_red = map_red.get(s)
+        if idx_red is not None:
+            Y_red_full[:, idx_full] = Y_red_interp[:, idx_red]
     mask_post = full_res.time > tau_full
     if mode == "1d" and x_full is not None:
         x_full_arr = np.asarray(x_full, dtype=float)
         if x_full_arr.size >= 2:
-            # ensure monotonicity for gradient/ignition computations
-            x_full_arr = np.maximum.accumulate(x_full_arr)
-            try:
-                x_ign_full = float(np.interp(tau_full, full_res.time, x_full_arr))
-            except Exception:
-                x_ign_full = x_full_arr[x_full_arr.size // 10] if x_full_arr.size else 0.0
-            L = float(x_full_arr[-1]) if x_full_arr.size else 1.0
-            upper = min(L, x_ign_full + 0.3 * L)
-            alt = (x_full_arr >= x_ign_full) & (x_full_arr <= upper)
-            if alt.any():
-                mask_post = alt
+            x_mono = np.maximum.accumulate(x_full_arr)
+        else:
+            x_mono = x_full_arr
+        try:
+            x_ign_full = float(np.interp(tau_full, full_res.time, x_mono))
+        except Exception:
+            x_ign_full = x_mono[x_mono.size // 10] if x_mono.size else 0.0
+        if x_mono.size:
+            L = float(x_mono[-1])
+        else:
+            L = 1.0
+        upper = min(L, x_ign_full + 0.3 * L)
+        alt = (x_mono >= x_ign_full) & (x_mono <= upper)
+        if np.any(alt):
+            mask_post = alt
+    if isinstance(mask_post, np.ndarray) and not np.any(mask_post):
+        mask_post = full_res.time > tau_full
+        if isinstance(mask_post, np.ndarray) and not np.any(mask_post):
+            mask_post = slice(None)
     diff = np.abs(full_res.mass_fractions[mask_post] - Y_red_full[mask_post])
-    pen_species = float(np.sum(np.asarray(weights) * diff.mean(axis=0)))
+    pen_species = float(np.sum(weights_arr * diff.mean(axis=0)))
 
     keep_cnt = int(sel.sum())
     size_frac = keep_cnt / len(selection)
@@ -539,6 +558,7 @@ def run_ga_reduction(
     tol_timescale: float = 0.05,
     tol_resid: float = 0.05,
     mode: str = "0d",
+    out_dir: str = "results",
 ):
     mech = Mechanism(mech_path)
 
@@ -642,13 +662,13 @@ def run_ga_reduction(
         epochs=200,
     )
 
-    os.makedirs("results", exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
 
     scores = predict_scores(
         model=gnn_model,
         G=G,
         solution=mech.solution,
-        save_path=os.path.join("results", "gnn_scores.csv"),
+        save_path=os.path.join(out_dir, "gnn_scores.csv"),
     )
 
     scores_arr = np.array([scores[s] for s in mech.species_names])
@@ -731,7 +751,7 @@ def run_ga_reduction(
     )
 
     # Debug drops per-gen
-    os.makedirs("results", exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
     for g, gen in enumerate(debug):
         best_g = max(gen, key=lambda x: x[-2])
         (
@@ -761,7 +781,7 @@ def run_ga_reduction(
             ign_shift,
             fit,
         )
-        with open(os.path.join("results", f"best_selection_gen{g:02d}.txt"), "w") as f:
+        with open(os.path.join(out_dir, f"best_selection_gen{g:02d}.txt"), "w") as f:
             f.write(",".join(map(str, genome.tolist())))
 
     # Selection report
@@ -774,7 +794,7 @@ def run_ga_reduction(
             dropped.append((s, labels.get(s, 0.0), scores.get(s, 0.0)))
     kept.sort(key=lambda x: x[1], reverse=True)
     dropped.sort(key=lambda x: x[1], reverse=True)
-    with open(os.path.join("results", "selection_report.csv"), "w", newline="") as f:
+    with open(os.path.join(out_dir, "selection_report.csv"), "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["status", "species", "label", "score"])
         for status, data in [("kept", kept[:20]), ("dropped", dropped[:20])]:
@@ -1017,18 +1037,11 @@ def _compute_case_metrics(
     tol_timescale: float,
     tol_resid: float,
 ) -> Dict[str, float]:
-    weights_arr = np.asarray(weights)
+    weights_arr = np.asarray(weights, dtype=float)
     map_full = {s: i for i, s in enumerate(species_full)}
     map_red = {s: i for i, s in enumerate(species_red)}
 
-    Y_red_interp = np.zeros((len(full_res.time), len(species_full)))
-    for name, idx in map_full.items():
-        if name in map_red:
-            Y_red_interp[:, idx] = np.interp(
-                full_res.time,
-                red_res.time,
-                red_res.mass_fractions[:, map_red[name]],
-            )
+    Y_red_interp = _interp_to(full_res.time, red_res.time, red_res.mass_fractions)
 
     pv_err = pv_error_aligned(
         full_res.mass_fractions,
@@ -1067,40 +1080,45 @@ def _compute_case_metrics(
     tau_spts_full = spts(full_res.time, full_res.mass_fractions)
     tau_spts_red = spts(red_res.time, red_res.mass_fractions)
 
-    (pv_full_ref, pv_red_ref), (spts_full_ref, spts_red_ref) = _ensure_same_grid(
-        full_res.time,
-        [
-            (full_res.time, tau_pv_full, red_res.time, tau_pv_red),
-            (full_res.time, tau_spts_full, red_res.time, tau_spts_red),
-        ],
-    )
+    log_full_pv = np.log10(tau_pv_full + 1e-30)
+    log_red_pv = _interp_to(full_res.time, red_res.time, np.log10(tau_pv_red + 1e-30))
+    log_full_spts = np.log10(tau_spts_full + 1e-30)
+    log_red_spts = _interp_to(full_res.time, red_res.time, np.log10(tau_spts_red + 1e-30))
 
-    log_full_pv = np.log10(pv_full_ref + 1e-30)
-    log_red_pv = np.log10(pv_red_ref + 1e-30)
-    log_full_spts = np.log10(spts_full_ref + 1e-30)
-    log_red_spts = np.log10(spts_red_ref + 1e-30)
-
-    tau_mis = np.linalg.norm(log_full_pv - log_red_pv) + np.linalg.norm(log_full_spts - log_red_spts)
+    tau_mis = _rms_norm(log_full_pv - log_red_pv) + _rms_norm(log_full_spts - log_red_spts)
 
     mask = full_res.time > delay_full
     if x_full is not None:
         x_full_arr = np.asarray(x_full, dtype=float)
         if x_full_arr.size >= 2:
-            x_full_arr = np.maximum.accumulate(x_full_arr)
-            try:
-                x_ign_full = float(np.interp(delay_full, full_res.time, x_full_arr))
-            except Exception:
-                x_ign_full = x_full_arr[x_full_arr.size // 10] if x_full_arr.size else 0.0
-            L = float(x_full_arr[-1]) if x_full_arr.size else 1.0
-            upper = min(L, x_ign_full + 0.3 * L)
-            alt = (x_full_arr >= x_ign_full) & (x_full_arr <= upper)
-            if alt.any():
-                mask = alt
+            x_mono = np.maximum.accumulate(x_full_arr)
+        else:
+            x_mono = x_full_arr
+        try:
+            x_ign_full = float(np.interp(delay_full, full_res.time, x_mono))
+        except Exception:
+            x_ign_full = x_mono[x_mono.size // 10] if x_mono.size else 0.0
+        if x_mono.size:
+            L = float(x_mono[-1])
+        else:
+            L = 1.0
+        upper = min(L, x_ign_full + 0.3 * L)
+        alt = (x_mono >= x_ign_full) & (x_mono <= upper)
+        if np.any(alt):
+            mask = alt
 
     if isinstance(mask, np.ndarray) and not np.any(mask):
-        mask = slice(None)
+        mask = full_res.time > delay_full
+        if isinstance(mask, np.ndarray) and not np.any(mask):
+            mask = slice(None)
 
-    diff = np.abs(full_res.mass_fractions[mask] - Y_red_interp[mask])
+    Y_red_full = np.zeros_like(full_res.mass_fractions)
+    for s, idx_full in map_full.items():
+        idx_red = map_red.get(s)
+        if idx_red is not None:
+            Y_red_full[:, idx_full] = Y_red_interp[:, idx_red]
+
+    diff = np.abs(full_res.mass_fractions[mask] - Y_red_full[mask])
     pen_species = float(np.sum(weights_arr * diff.mean(axis=0)))
 
     ratios = (
@@ -1206,6 +1224,7 @@ def _full_pipeline_batch(
         runner=runner,
         fitness_mode="standard",
         mode="0d",
+        out_dir=out_dir,
     )
 
     os.makedirs(out_dir, exist_ok=True)
@@ -1278,6 +1297,7 @@ def _full_pipeline_batch(
     mask = full.time > delay_full
     map_full = {s: i for i, s in enumerate(mech.species_names)}
     map_red = {s: i for i, s in enumerate(red_mech.species_names)}
+    red_interp_full = _interp_to(full.time, red.time, red.mass_fractions)
     with open(os.path.join(out_dir, "residual_species.csv"), "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["species", "mean_res", "max_res"])
@@ -1285,7 +1305,7 @@ def _full_pipeline_batch(
             if s not in map_red:
                 continue
             yf = full.mass_fractions[mask, map_full[s]]
-            yr = np.interp(full.time[mask], red.time, red.mass_fractions[:, map_red[s]])
+            yr = red_interp_full[mask, map_red[s]]
             diff = np.abs(yf - yr)
             writer.writerow([s, float(diff.mean()), float(diff.max())])
 
@@ -1338,7 +1358,7 @@ def _full_pipeline_batch(
     # 4) PV error (aligned) + PV overlay
     pv_err = pv_error_aligned(
         full.mass_fractions,
-        red.mass_fractions,
+        red_interp_full,
         mech.species_names,
         red_mech.species_names,
         weights,
@@ -1586,6 +1606,7 @@ def _full_pipeline_pfr(
         tol_timescale=tol_timescale,
         tol_resid=tol_resid,
         mode="1d",
+        out_dir=out_dir,
     )
 
     os.makedirs(out_dir, exist_ok=True)
