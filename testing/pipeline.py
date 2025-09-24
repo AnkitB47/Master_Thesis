@@ -3,9 +3,10 @@ import json
 import csv
 import logging
 import numpy as np
+import pandas as pd
 import cantera as ct
 
-from typing import Sequence, Dict, Tuple, List
+from typing import Sequence, Dict, Tuple, List, Callable
 
 from mechanism.loader import Mechanism
 from mechanism.mix import methane_air_mole_fractions, mole_to_mass_fractions, HR_PRESETS
@@ -271,12 +272,18 @@ def evaluate_selection(
     tau_pv_full,
     tau_spts_full,
     target_species: int | None,
+    fitness_mode: str = "standard",
+    tol_pv: float = 0.05,
+    tol_delay: float = 0.05,
+    tol_timescale: float = 0.05,
+    tol_resid: float = 0.05,
+    mode: str = "0d",
     zeta: float = 20.0,
 ):
     reason = ""
 
     if critical_idxs and (selection.sum() < max(4, len(critical_idxs)) or np.any(selection[critical_idxs] == 0)):
-        info = (1.0, 1.0, 0.0, 0.0, 0.0, "missing_critical", int(selection.sum()), 0.0, 0.0, 0.0)
+        info = (1.0, 1.0, 0.0, 0.0, 0.0, 0.0, "missing_critical", int(selection.sum()), 0.0, 0.0, 0.0)
         return -1e6, *info
 
     sel = selection.copy()
@@ -306,10 +313,10 @@ def evaluate_selection(
                 sel[critical_idxs] = 1
                 attempt += 1
                 continue
-            info = (1.0, 1.0, 0.0, 0.0, 0.0, str(e), int(sel.sum()), 0.0, 0.0, 0.0)
+            info = (1.0, 1.0, 0.0, 0.0, 0.0, 0.0, str(e), int(sel.sum()), 0.0, 0.0, 0.0)
             return -1e6, *info
         except Exception as e:
-            info = (1.0, 1.0, 0.0, 0.0, 0.0, f"sim_failed:{type(e).__name__}", int(sel.sum()), 0.0, 0.0, 0.0)
+            info = (1.0, 1.0, 0.0, 0.0, 0.0, 0.0, f"sim_failed:{type(e).__name__}", int(sel.sum()), 0.0, 0.0, 0.0)
             return -1e6, *info
         break
 
@@ -327,6 +334,21 @@ def evaluate_selection(
     )
     delay_red, _ = ignition_delay(res.time, res.temperature)
     delay_diff = abs(delay_red - tau_full) / max(tau_full, 1e-12)
+    x_full = getattr(full_res, "x", None)
+    x_red = getattr(res, "x", None)
+    ign_shift = 0.0
+    delay_metric = delay_diff
+    if mode == "1d" and x_full is not None and x_red is not None:
+        x_full_arr = np.asarray(x_full, dtype=float)
+        x_red_arr = np.asarray(x_red, dtype=float)
+        try:
+            x_ign_full = float(np.interp(tau_full, full_res.time, x_full_arr))
+            x_ign_red = float(np.interp(delay_red, res.time, x_red_arr))
+            ign_shift = abs(x_ign_red - x_ign_full) / max(x_ign_full, 1e-12)
+            delay_metric = 0.5 * (delay_diff + ign_shift)
+        except Exception:  # pragma: no cover (fallback when interpolation fails)
+            ign_shift = 0.0
+            delay_metric = delay_diff
     delta_T = float(res.temperature[-1] - res.temperature[0])
     delta_Y = float(np.max(np.abs(res.mass_fractions[-1] - res.mass_fractions[0])))
 
@@ -346,7 +368,16 @@ def evaluate_selection(
     for s, j in map_full.items():
         if s in map_red:
             Y_red_full[:, j] = Y_red_interp[:, map_red[s]]
-    mask_post = full_res.time > tau_full
+    if mode == "1d" and x_full is not None:
+        x_full_arr = np.asarray(x_full, dtype=float)
+        x_ign_full = float(np.interp(tau_full, full_res.time, x_full_arr)) if len(x_full_arr) else 0.0
+        L = float(x_full_arr[-1]) if len(x_full_arr) else 1.0
+        upper = min(L, x_ign_full + 0.3 * L)
+        mask_post = (x_full_arr >= x_ign_full) & (x_full_arr <= upper)
+        if not np.any(mask_post):
+            mask_post = full_res.time > tau_full
+    else:
+        mask_post = full_res.time > tau_full
     diff = np.abs(full_res.mass_fractions[mask_post] - Y_red_full[mask_post])
     pen_species = float(np.sum(np.asarray(weights) * diff.mean(axis=0)))
 
@@ -357,14 +388,30 @@ def evaluate_selection(
         qpen = ((keep_cnt - target_species) / len(selection)) ** 2
         size_pen += 3.0 * qpen
 
-    fitness = -(1.0 * err + 12.0 * delay_diff + 1.0 * tau_mis + zeta * pen_species + size_pen)
+    if fitness_mode == "threshold":
+        ratios = (
+            err / max(tol_pv, 1e-12),
+            delay_metric / max(tol_delay, 1e-12),
+            tau_mis / max(tol_timescale, 1e-12),
+            pen_species / max(tol_resid, 1e-12),
+        )
+        exceed = [max(0.0, r - 1.0) for r in ratios]
+        if any(val > 0.0 for val in exceed):
+            reason = "threshold_fail"
+            fitness = -1e6 * sum(exceed) - size_pen
+        else:
+            margin = sum(1.0 - r for r in ratios)
+            fitness = 100.0 + margin - size_pen - 0.1 * tau_mis
+    else:
+        fitness = -(1.0 * err + 12.0 * delay_metric + 1.0 * tau_mis + zeta * pen_species + size_pen)
 
     info = (
         float(err),
-        float(delay_diff),
+        float(delay_metric),
         float(size_pen),
         float(tau_mis),
         float(pen_species),
+        float(ign_shift),
         reason,
         keep_cnt,
         float(delta_T),
@@ -372,13 +419,15 @@ def evaluate_selection(
         float(delay_red),
     )
     logger.info(
-        "ΔT=%.3e ΔY=%.3e delay=%.3e pv_err=%.3e τ_mis=%.3e pen=%.3e fitness=%.3e",
+        "ΔT=%.3e ΔY=%.3e τred=%.3e metric=%.3e pv_err=%.3e τ_mis=%.3e pen=%.3e shift=%.3e fitness=%.3e",
         delta_T,
         delta_Y,
         delay_red,
+        delay_metric,
         err,
         tau_mis,
         pen_species,
+        ign_shift,
         fitness,
     )
 
@@ -408,13 +457,20 @@ def run_ga_reduction(
     generations: int = 60,
     population_size: int = 40,
     mutation_rate: float = 0.25,
+    runner: Callable | None = None,
+    fitness_mode: str = "standard",
+    tol_pv: float = 0.05,
+    tol_delay: float = 0.05,
+    tol_timescale: float = 0.05,
+    tol_resid: float = 0.05,
+    mode: str = "0d",
 ):
     mech = Mechanism(mech_path)
 
-    runner = run_isothermal_const_p if isothermal else run_constant_pressure
+    runner_fn = runner or (run_isothermal_const_p if isothermal else run_constant_pressure)
 
     # Reference run (full window)
-    full = runner(
+    full = runner_fn(
         mech.solution,
         T0,
         p0,
@@ -432,7 +488,7 @@ def run_ga_reduction(
         coarse = np.geomspace(1e-12, tf, steps)
         time_grid = np.unique(np.concatenate((coarse, dense)))
         time_grid = np.insert(time_grid, 0, 0.0)
-        full = runner(
+        full = runner_fn(
             mech.solution,
             T0,
             p0,
@@ -464,7 +520,7 @@ def run_ga_reduction(
     logger.info("Species weights (first 5): %s", list(zip(mech.species_names, weights))[:5])
 
     # --- Short-window baseline for LOO
-    full_short = _baseline_short_run(mech, T0, p0, Y0, tf_short, steps_short, log_times, runner)
+    full_short = _baseline_short_run(mech, T0, p0, Y0, tf_short, steps_short, log_times, runner_fn)
 
     # Graph + labels
     G = build_species_graph(mech.solution)
@@ -500,7 +556,7 @@ def run_ga_reduction(
         alpha,
         critical,
         cache_labels,
-        runner,
+        runner_fn,
     )
 
     # GNN training (labels are already normalized 0..1)
@@ -572,6 +628,12 @@ def run_ga_reduction(
         tau_pv_full,
         tau_spts_full,
         target_species,
+        fitness_mode,
+        tol_pv,
+        tol_delay,
+        tol_timescale,
+        tol_resid,
+        mode,
     )
 
     ms = min_species or (len(critical_idxs) + 5)
@@ -597,9 +659,23 @@ def run_ga_reduction(
     os.makedirs("results", exist_ok=True)
     for g, gen in enumerate(debug):
         best_g = max(gen, key=lambda x: x[-2])
-        pv_err, delay_diff, size_pen, tau_mis, pen_species, reason, keep_cnt, dT, dY, delay_red, fit, genome = best_g
+        (
+            pv_err,
+            delay_diff,
+            size_pen,
+            tau_mis,
+            pen_species,
+            ign_shift,
+            reason,
+            keep_cnt,
+            dT,
+            dY,
+            delay_red,
+            fit,
+            genome,
+        ) = best_g
         logger.info(
-            "gen %02d keep=%d ΔT=%.3e delay=%.3e pv_err=%.3e τ_mis=%.3e pen=%.3e fitness=%.3e",
+            "gen %02d keep=%d ΔT=%.3e delay=%.3e pv_err=%.3e τ_mis=%.3e pen=%.3e shift=%.3e fitness=%.3e",
             g,
             keep_cnt,
             dT,
@@ -607,6 +683,7 @@ def run_ga_reduction(
             pv_err,
             tau_mis,
             pen_species,
+            ign_shift,
             fit,
         )
         with open(os.path.join("results", f"best_selection_gen{g:02d}.txt"), "w") as f:
@@ -635,11 +712,239 @@ def run_ga_reduction(
     return ["GA"], [sel], [hist], debug, full, weights
 
 
+def _load_envelopes(path: str) -> dict:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Envelope specification '{path}' not found")
+    with open(path) as f:
+        return json.load(f)
+
+
+def _entry_nominal(entry: dict | None) -> float | None:
+    if not entry:
+        return None
+    if entry.get("nominal") is not None:
+        return float(entry["nominal"])
+    values = [entry.get("min"), entry.get("max")]
+    vals = [float(v) for v in values if v is not None]
+    if vals:
+        return float(np.mean(vals))
+    return None
+
+
+def _entry_min(entry: dict | None) -> float | None:
+    if not entry:
+        return None
+    if entry.get("min") is not None:
+        return float(entry["min"])
+    return _entry_nominal(entry)
+
+
+def _entry_max(entry: dict | None) -> float | None:
+    if not entry:
+        return None
+    if entry.get("max") is not None:
+        return float(entry["max"])
+    return _entry_nominal(entry)
+
+
+def _two_point_cases(name: str, env: dict) -> list[dict]:
+    phi_min = _entry_min(env.get("phi"))
+    phi_max = _entry_max(env.get("phi"))
+    T_min = _entry_min(env.get("T0_K"))
+    T_max = _entry_max(env.get("T0_K"))
+    p_min = _entry_min(env.get("p_bar"))
+    p_max = _entry_max(env.get("p_bar"))
+    p_nom = _entry_nominal(env.get("p_bar")) or 1.0
+    diluents = env.get("diluents", [])
+    ratio = env.get("CO2_CH4_ratio") or {}
+    ratio_nom = float(ratio.get("nominal")) if isinstance(ratio, dict) and ratio.get("nominal") is not None else None
+
+    def _pa(val: float | None) -> float:
+        return float((val if val is not None else p_nom) * 1e5)
+
+    phi_low = float(phi_min if phi_min is not None else (phi_max or 1.0))
+    phi_high = float(phi_max if phi_max is not None else (phi_min or 1.0))
+    T_high = float(T_max if T_max is not None else (T_min or 300.0))
+    T_low = float(T_min if T_min is not None else (T_max or 300.0))
+
+    cases = [
+        {
+            "id": f"{name.lower()}_low",
+            "application": name,
+            "phi": phi_low,
+            "T0": T_high,
+            "p": _pa(p_min),
+            "diluents": diluents,
+            "co2_ch4_ratio": ratio_nom,
+            "label": "min_phi_max_T",
+        },
+        {
+            "id": f"{name.lower()}_high",
+            "application": name,
+            "phi": phi_high,
+            "T0": T_low,
+            "p": _pa(p_max),
+            "diluents": diluents,
+            "co2_ch4_ratio": ratio_nom,
+            "label": "max_phi_min_T",
+        },
+    ]
+    return cases
+
+
+def _compose_feed(
+    sol: ct.Solution,
+    phi: float,
+    base_diluent: str,
+    diluent_specs: list[dict],
+    *,
+    radical_seed: Dict[str, float] | None = None,
+    co2_ratio: float | None = None,
+) -> Dict[str, float]:
+    mix = methane_air_mole_fractions(phi, diluent=base_diluent)
+    dil_total = 0.0
+    dil_map: Dict[str, float] = {}
+    for item in diluent_specs:
+        frac = item.get("fraction", {}).get("nominal") if isinstance(item.get("fraction"), dict) else None
+        if frac is None:
+            continue
+        val = float(frac)
+        if val <= 0:
+            continue
+        species = item.get("species", "")
+        if not species:
+            continue
+        dil_map[species] = dil_map.get(species, 0.0) + val
+        dil_total += val
+
+    seed_total = sum(radical_seed.values()) if radical_seed else 0.0
+    if dil_total + seed_total > 0.99:
+        logger.warning("Diluent + seed fractions %.2f exceed unity; scaling base fuel portion", dil_total + seed_total)
+    base_fraction = max(1e-6, 1.0 - dil_total - seed_total)
+
+    scaled = {sp: val * base_fraction for sp, val in mix.items()}
+    for sp, frac in dil_map.items():
+        scaled[sp] = scaled.get(sp, 0.0) + frac
+    if radical_seed:
+        for sp, frac in radical_seed.items():
+            scaled[sp] = scaled.get(sp, 0.0) + frac
+
+    if co2_ratio is not None and co2_ratio > 0 and "CH4" in scaled:
+        ch4 = scaled["CH4"]
+        target = co2_ratio * ch4
+        scaled["CO2"] = max(scaled.get("CO2", 0.0), target)
+
+    total = sum(scaled.values())
+    if total <= 0:
+        raise ValueError("Mixture fractions sum to zero")
+    scaled = {k: v / total for k, v in scaled.items()}
+    return mole_to_mass_fractions(sol, scaled)
+
+
+def _compute_case_metrics(
+    full_res,
+    red_res,
+    species_full: Sequence[str],
+    species_red: Sequence[str],
+    weights: Sequence[float],
+    tol_pv: float,
+    tol_delay: float,
+    tol_timescale: float,
+    tol_resid: float,
+) -> Dict[str, float]:
+    weights_arr = np.asarray(weights)
+    map_full = {s: i for i, s in enumerate(species_full)}
+    map_red = {s: i for i, s in enumerate(species_red)}
+
+    Y_red_interp = np.zeros((len(full_res.time), len(species_full)))
+    for name, idx in map_full.items():
+        if name in map_red:
+            Y_red_interp[:, idx] = np.interp(
+                full_res.time,
+                red_res.time,
+                red_res.mass_fractions[:, map_red[name]],
+            )
+
+    pv_err = pv_error_aligned(
+        full_res.mass_fractions,
+        Y_red_interp,
+        species_full,
+        species_red,
+        weights_arr,
+    )
+    delay_full, _ = ignition_delay(full_res.time, full_res.temperature)
+    delay_red, _ = ignition_delay(red_res.time, red_res.temperature)
+    delay_ratio = abs(delay_red - delay_full) / max(delay_full, 1e-12)
+
+    x_full = getattr(full_res, "x", None)
+    x_red = getattr(red_res, "x", None)
+    ign_shift = 0.0
+    delay_metric = delay_ratio
+    if x_full is not None and x_red is not None:
+        x_full_arr = np.asarray(x_full, dtype=float)
+        x_red_arr = np.asarray(x_red, dtype=float)
+        if x_full_arr.size > 0 and x_red_arr.size > 0:
+            x_ign_full = float(np.interp(delay_full, full_res.time, x_full_arr))
+            x_ign_red = float(np.interp(delay_red, red_res.time, x_red_arr))
+            ign_shift = abs(x_ign_red - x_ign_full) / max(x_ign_full, 1e-12)
+            delay_metric = 0.5 * (delay_ratio + ign_shift)
+
+    _, tau_pv_full = pv_timescale(full_res.time, full_res.mass_fractions, species_full)
+    _, tau_pv_red = pv_timescale(red_res.time, red_res.mass_fractions, species_red)
+    tau_spts_full = spts(full_res.time, full_res.mass_fractions)
+    tau_spts_red = spts(red_res.time, red_res.mass_fractions)
+    tau_mis = np.linalg.norm(np.log10(tau_pv_full + 1e-30) - np.log10(tau_pv_red + 1e-30))
+    tau_mis += np.linalg.norm(np.log10(tau_spts_full + 1e-30) - np.log10(tau_spts_red + 1e-30))
+
+    if x_full is not None:
+        x_full_arr = np.asarray(x_full, dtype=float)
+        x_ign_full = float(np.interp(delay_full, full_res.time, x_full_arr)) if x_full_arr.size else 0.0
+        L = float(x_full_arr[-1]) if x_full_arr.size else 1.0
+        upper = min(L, x_ign_full + 0.3 * L)
+        mask = (x_full_arr >= x_ign_full) & (x_full_arr <= upper)
+        if not np.any(mask):
+            mask = full_res.time > delay_full
+    else:
+        mask = full_res.time > delay_full
+
+    if isinstance(mask, np.ndarray) and not np.any(mask):
+        mask = slice(None)
+
+    diff = np.abs(full_res.mass_fractions[mask] - Y_red_interp[mask])
+    pen_species = float(np.sum(weights_arr * diff.mean(axis=0)))
+
+    ratios = (
+        pv_err / max(tol_pv, 1e-12),
+        delay_metric / max(tol_delay, 1e-12),
+        tau_mis / max(tol_timescale, 1e-12),
+        pen_species / max(tol_resid, 1e-12),
+    )
+    passes = all(r <= 1.0 for r in ratios)
+    exceed = [max(0.0, r - 1.0) for r in ratios]
+    if passes:
+        margin = sum(1.0 - r for r in ratios)
+        score = 100.0 + margin - 0.1 * tau_mis
+    else:
+        score = -1e6 * sum(exceed)
+
+    return {
+        "pv_err": float(pv_err),
+        "delay_metric": float(delay_metric),
+        "tau_mis": float(tau_mis),
+        "pen_species": float(pen_species),
+        "ign_shift": float(ign_shift),
+        "delay_full": float(delay_full),
+        "delay_red": float(delay_red),
+        "passes": passes,
+        "score": float(score),
+    }
+
+
 # -------------------------------
 # Full pipeline entry point
 # -------------------------------
 
-def full_pipeline(
+def _full_pipeline_batch(
     mech_path: str,
     out_dir: str,
     steps: int = 1000,
@@ -708,6 +1013,9 @@ def full_pipeline(
         generations=generations,
         population_size=population,
         mutation_rate=mutation,
+        runner=runner,
+        fitness_mode="standard",
+        mode="0d",
     )
 
     os.makedirs(out_dir, exist_ok=True)
@@ -730,6 +1038,7 @@ def full_pipeline(
             "size_penalty",
             "tau_mismatch",
             "pen_species",
+            "ignition_shift",
             "reason",
             "keep_count",
             "delta_T",
@@ -739,8 +1048,10 @@ def full_pipeline(
         ])
         for g, gen in enumerate(debug):
             for i, d in enumerate(gen):
-                pv_err, delay_diff, size_pen, tau_mis, pen_species, reason, keep_cnt, dT, dY, delay_red, fit, genome = d
-                writer.writerow([g, i, pv_err, delay_diff, size_pen, tau_mis, pen_species, reason, keep_cnt, dT, dY, delay_red, fit])
+                pv_err, delay_diff, size_pen, tau_mis, pen_species, ign_shift, reason, keep_cnt, dT, dY, delay_red, fit, genome = d
+                writer.writerow(
+                    [g, i, pv_err, delay_diff, size_pen, tau_mis, pen_species, ign_shift, reason, keep_cnt, dT, dY, delay_red, fit]
+                )
 
         # Build reduced mechanism from best selection
     best_sel = sols[0]
@@ -913,6 +1224,7 @@ def full_pipeline(
                     "delay_diff",
                     "tau_mis",
                     "post_ign_resid",
+                    "ignition_shift",
                     "kept_species",
                 ]
             )
@@ -928,7 +1240,20 @@ def full_pipeline(
                 else:
                     T0g, p0g, Y0g = HR_PRESETS[preset](mech.solution)
 
-                fit, pv_e, delay_d, size_p, tau_m, pen, reason, keep_cnt, dT, dY, delay_r = evaluate_selection(
+                (
+                    fit,
+                    pv_e,
+                    delay_d,
+                    size_p,
+                    tau_m,
+                    pen,
+                    ign_shift,
+                    reason,
+                    keep_cnt,
+                    dT,
+                    dY,
+                    delay_r,
+                ) = evaluate_selection(
                     sols[0],
                     mech,
                     Y0g,
@@ -948,7 +1273,7 @@ def full_pipeline(
                 )
                 feasible = np.isfinite(fit)
                 writer.writerow(
-                    [phi, T0g, p0g, feasible, pv_e, delay_d, tau_m, 0.0, int(sols[0].sum())]
+                    [phi, T0g, p0g, feasible, pv_e, delay_d, tau_m, pen, ign_shift, int(sols[0].sum())]
                 )
 
     # --- Console summary
@@ -961,3 +1286,513 @@ def full_pipeline(
               f"  Reactions: {len(mech.reactions())} -> {len(red_mech.reactions())}\n"
               f"  Delay_full/red: {delay_full:.3e} / {delay_red:.3e} s\n"
               f"  PV_error: {pv_err*100:.1f}%")
+
+
+def _full_pipeline_pfr(
+    mech_path: str,
+    out_dir: str,
+    steps: int,
+    phi: float | None,
+    T0: float | None,
+    p0: float | None,
+    log_times: bool,
+    alpha: float,
+    tf_short: float | None,
+    steps_short: int | None,
+    cache_labels: bool,
+    min_species: int | None,
+    max_species: int | None,
+    target_species: int | None,
+    generations: int,
+    population: int,
+    mutation: float,
+    fitness_mode: str,
+    tol_pv: float,
+    tol_delay: float,
+    tol_timescale: float,
+    tol_resid: float,
+    diluent: str,
+    L: float,
+    D: float,
+    mdot: float,
+    U: float,
+    Tw: float | None,
+    plasma_length: float,
+    T_plasma_out: float | None,
+    radical_seed: Dict[str, float] | None,
+    envelopes_path: str,
+):
+    mech = Mechanism(mech_path)
+    envelopes = _load_envelopes(envelopes_path)
+    pox_env = envelopes.get("POX", {})
+
+    phi_base = float(phi if phi is not None else (_entry_nominal(pox_env.get("phi")) or 1.5))
+    T0_base = float(T0 if T0 is not None else (_entry_nominal(pox_env.get("T0_K")) or 520.0))
+    p0_base = float(p0 if p0 is not None else ((_entry_nominal(pox_env.get("p_bar")) or 5.0) * 1e5))
+
+    seed_dict = radical_seed or {}
+    Y0 = _compose_feed(
+        mech.solution,
+        phi_base,
+        diluent,
+        pox_env.get("diluents", []),
+        radical_seed=seed_dict if seed_dict else None,
+    )
+
+    config = PFRConfig(
+        length=L,
+        diameter=D,
+        mass_flow=mdot,
+        pressure=p0_base,
+        n_points=max(steps + 1, 300),
+        heat_transfer_coeff=U,
+        wall_temperature=Tw,
+        enable_heat_loss=U > 0.0,
+        plasma_length=plasma_length,
+        plasma_temperature=T_plasma_out,
+    )
+    runner = PFRRunner(config, base_points=max(steps + 1, 300))
+
+    base_res = runner(
+        mech.solution,
+        T0_base,
+        p0_base,
+        Y0,
+        tf=1.0,
+        nsteps=steps,
+        use_mole=False,
+    )
+    tf_total = float(base_res.time[-1])
+    steps_effective = len(base_res.time) - 1
+    if tf_short is None:
+        tf_short = 0.4 * tf_total
+    if steps_short is None:
+        steps_short = max(50, max(steps_effective // 2, 10))
+    config.max_residence_time = max(config.max_residence_time or 0.0, 1.5 * tf_total)
+
+    names, sols, hists, debug, full, weights = run_ga_reduction(
+        mech_path,
+        Y0,
+        tf_total,
+        steps_effective,
+        T0_base,
+        p0_base,
+        log_times,
+        alpha,
+        tf_short,
+        steps_short,
+        cache_labels,
+        False,
+        min_species=min_species,
+        max_species=max_species,
+        target_species=target_species,
+        generations=generations,
+        population_size=population,
+        mutation_rate=mutation,
+        runner=runner,
+        fitness_mode=fitness_mode,
+        tol_pv=tol_pv,
+        tol_delay=tol_delay,
+        tol_timescale=tol_timescale,
+        tol_resid=tol_resid,
+        mode="1d",
+    )
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    with open(os.path.join(out_dir, "ga_fitness.csv"), "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["generation", "fitness"])
+        for i, val in enumerate(hists[0]):
+            writer.writerow([i, val])
+
+    with open(os.path.join(out_dir, "debug_fitness.csv"), "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(
+            [
+                "generation",
+                "individual",
+                "pv_error",
+                "delay_diff",
+                "size_penalty",
+                "tau_mismatch",
+                "pen_species",
+                "ignition_shift",
+                "reason",
+                "keep_count",
+                "delta_T",
+                "delta_Y",
+                "delay_red",
+                "fitness",
+            ]
+        )
+        for g, gen in enumerate(debug):
+            for i, d in enumerate(gen):
+                (
+                    pv_err,
+                    delay_diff,
+                    size_pen,
+                    tau_mis,
+                    pen_species,
+                    ign_shift,
+                    reason,
+                    keep_cnt,
+                    dT,
+                    dY,
+                    delay_red,
+                    fit,
+                    genome,
+                ) = d
+                writer.writerow(
+                    [g, i, pv_err, delay_diff, size_pen, tau_mis, pen_species, ign_shift, reason, keep_cnt, dT, dY, delay_red, fit]
+                )
+
+    best_sel = sols[0]
+    keep = [mech.species_names[i] for i, bit in enumerate(best_sel) if bit]
+    red_mech = Mechanism(mech_path)
+    red_mech.remove_species([s for s in red_mech.species_names if s not in keep])
+
+    with open(os.path.join(out_dir, "reduced_species.txt"), "w") as f:
+        for s in keep:
+            f.write(s + "\n")
+
+    red_base = runner(
+        red_mech.solution,
+        T0_base,
+        p0_base,
+        Y0,
+        tf_total,
+        nsteps=len(full.time) - 1,
+        use_mole=False,
+        time_grid=full.time,
+    )
+
+    base_metrics = _compute_case_metrics(
+        full,
+        red_base,
+        mech.species_names,
+        red_mech.species_names,
+        weights,
+        tol_pv,
+        tol_delay,
+        tol_timescale,
+        tol_resid,
+    )
+    logger.info(
+        "Base 1D metrics: pv_err=%.3e delay=%.3e tau_mis=%.3e pen=%.3e shift=%.3e",
+        base_metrics["pv_err"],
+        base_metrics["delay_metric"],
+        base_metrics["tau_mis"],
+        base_metrics["pen_species"],
+        base_metrics["ign_shift"],
+    )
+
+    wp5_cases: list[dict] = []
+    for name in ("POX", "HP_POX", "CO2_recycle"):
+        if name in envelopes:
+            wp5_cases.extend(_two_point_cases(name, envelopes[name]))
+    plasma_cases = _two_point_cases("PLASMA", envelopes["PLASMA"]) if "PLASMA" in envelopes else []
+
+    profile_species = ["CH4", "CO", "H2", "CO2", "H2O", "O2"]
+    profiles_rows: list[dict] = []
+    kpi_rows: list[dict] = []
+    robustness_wp5: list[dict] = []
+    robustness_plasma: list[dict] = []
+    overlay_data: list[dict] = []
+
+    def _evaluate_case(case: dict, use_seed: bool) -> None:
+        seed = seed_dict if use_seed and seed_dict else None
+        Y_case = _compose_feed(
+            mech.solution,
+            case["phi"],
+            diluent,
+            case.get("diluents", []),
+            radical_seed=seed,
+            co2_ratio=case.get("co2_ch4_ratio"),
+        )
+        full_case = runner(
+            mech.solution,
+            case["T0"],
+            case["p"],
+            Y_case,
+            tf_total,
+            nsteps=steps_effective,
+            use_mole=False,
+        )
+        red_case = runner(
+            red_mech.solution,
+            case["T0"],
+            case["p"],
+            Y_case,
+            tf_total,
+            nsteps=len(full_case.time) - 1,
+            use_mole=False,
+            time_grid=full_case.time,
+        )
+
+        metrics = _compute_case_metrics(
+            full_case,
+            red_case,
+            mech.species_names,
+            red_mech.species_names,
+            weights,
+            tol_pv,
+            tol_delay,
+            tol_timescale,
+            tol_resid,
+        )
+
+        ch4_full = float(full_case.ch4_conversion[-1])
+        ch4_red = float(red_case.ch4_conversion[-1])
+        co2_full = float(full_case.co2_conversion[-1])
+        co2_red = float(red_case.co2_conversion[-1])
+        h2co_full = float(full_case.h2_co_ratio[-1])
+        h2co_red = float(red_case.h2_co_ratio[-1])
+        ign_full = float(full_case.ignition_position)
+        ign_red = float(red_case.ignition_position)
+
+        kpi_rows.append(
+            {
+                "case_id": case["id"],
+                "application": case["application"],
+                "phi": case["phi"],
+                "T0": case["T0"],
+                "p": case["p"],
+                "CH4_full": ch4_full,
+                "CH4_red": ch4_red,
+                "CO2_full": co2_full,
+                "CO2_red": co2_red,
+                "H2CO_full": h2co_full,
+                "H2CO_red": h2co_red,
+                "ignition_full": ign_full,
+                "ignition_red": ign_red,
+                "pv_err": metrics["pv_err"],
+                "delay_metric": metrics["delay_metric"],
+                "tau_mis": metrics["tau_mis"],
+                "pen_species": metrics["pen_species"],
+                "ign_shift": metrics["ign_shift"],
+                "passes": metrics["passes"],
+            }
+        )
+
+        entry = {
+            "case_id": case["id"],
+            "application": case["application"],
+            "pv_err": metrics["pv_err"],
+            "delay_metric": metrics["delay_metric"],
+            "tau_mis": metrics["tau_mis"],
+            "pen_species": metrics["pen_species"],
+            "ign_shift": metrics["ign_shift"],
+            "score": metrics["score"],
+            "passes": metrics["passes"],
+        }
+        if case["application"] == "PLASMA":
+            robustness_plasma.append(entry)
+        else:
+            robustness_wp5.append(entry)
+
+        overlay_species = {}
+        map_full = {s: i for i, s in enumerate(mech.species_names)}
+        map_red = {s: i for i, s in enumerate(red_mech.species_names)}
+        for sp in profile_species:
+            idx_f = map_full.get(sp)
+            idx_r = map_red.get(sp)
+            if idx_f is not None:
+                yf = full_case.mass_fractions[:, idx_f]
+            else:
+                yf = np.zeros_like(full_case.temperature)
+            if idx_r is not None:
+                yr = red_case.mass_fractions[:, idx_r]
+            else:
+                yr = np.zeros_like(red_case.temperature)
+            overlay_species[sp] = (yf, yr)
+
+        overlay_data.append(
+            {
+                "id": case["id"],
+                "application": case["application"],
+                "x": full_case.x,
+                "T_full": full_case.temperature,
+                "T_red": red_case.temperature,
+                "ign_full": ign_full,
+                "ign_red": ign_red,
+                "species": overlay_species,
+            }
+        )
+
+        for j, x_val in enumerate(full_case.x):
+            row = {
+                "case_id": case["id"],
+                "application": case["application"],
+                "x": float(x_val),
+                "temperature_full": float(full_case.temperature[j]),
+                "temperature_red": float(red_case.temperature[j]),
+                "ch4_conv_full": float(full_case.ch4_conversion[j]),
+                "ch4_conv_red": float(red_case.ch4_conversion[j]),
+                "h2co_full": float(full_case.h2_co_ratio[j]),
+                "h2co_red": float(red_case.h2_co_ratio[j]),
+            }
+            for sp in profile_species:
+                idx_f = map_full.get(sp)
+                idx_r = map_red.get(sp)
+                row[f"{sp}_full"] = float(full_case.mass_fractions[j, idx_f]) if idx_f is not None else 0.0
+                row[f"{sp}_red"] = float(red_case.mass_fractions[j, idx_r]) if idx_r is not None else 0.0
+            profiles_rows.append(row)
+
+    for case in wp5_cases:
+        _evaluate_case(case, use_seed=False)
+    for case in plasma_cases:
+        _evaluate_case(case, use_seed=True)
+
+    with open(os.path.join(out_dir, "pfr_profiles.csv"), "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=profiles_rows[0].keys()) if profiles_rows else None
+        if writer:
+            writer.writeheader()
+            for row in profiles_rows:
+                writer.writerow(row)
+
+    with open(os.path.join(out_dir, "pfr_kpis.csv"), "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=kpi_rows[0].keys()) if kpi_rows else None
+        if writer:
+            writer.writeheader()
+            for row in kpi_rows:
+                writer.writerow(row)
+
+    if robustness_wp5:
+        with open(os.path.join(out_dir, "robustness_1d.csv"), "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=robustness_wp5[0].keys())
+            writer.writeheader()
+            for row in robustness_wp5:
+                writer.writerow(row)
+    if robustness_plasma:
+        with open(os.path.join(out_dir, "robustness_plasma.csv"), "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=robustness_plasma[0].keys())
+            writer.writeheader()
+            for row in robustness_plasma:
+                writer.writerow(row)
+
+    df_kpi = pd.DataFrame(kpi_rows)
+    df_wp5 = pd.DataFrame(robustness_wp5)
+    df_plasma = pd.DataFrame(robustness_plasma)
+
+    latex_dir = os.path.join("results", "latex")
+    os.makedirs(latex_dir, exist_ok=True)
+    if not df_wp5.empty:
+        df_wp5.to_latex(os.path.join(latex_dir, "robustness_pox.tex"), index=False, float_format="%.3f")
+    if not df_plasma.empty:
+        df_plasma.to_latex(os.path.join(latex_dir, "robustness_plasma.tex"), index=False, float_format="%.3f")
+    if not df_kpi.empty:
+        df_kpi.to_latex(os.path.join(latex_dir, "kpi_summary.tex"), index=False, float_format="%.3f")
+
+    viz_dir = os.path.join(out_dir, "visualizations")
+    plot_axial_overlays(overlay_data, profile_species, os.path.join(viz_dir, "axial_overlay"))
+    plot_kpi_bars(df_kpi, os.path.join(viz_dir, "kpi_bars"))
+    plot_consistency_stub(df_kpi, os.path.join(viz_dir, "consistency"), baseline=None)
+
+    logger.info("1D pipeline completed with %d WP5 cases and %d plasma cases", len(wp5_cases), len(plasma_cases))
+
+
+def full_pipeline(
+    mech_path: str,
+    out_dir: str,
+    steps: int = 1000,
+    tf: float = 0.5,
+    phi: float | None = None,
+    preset: str = "methane_air",
+    T0: float | None = None,
+    p0: float | None = None,
+    log_times: bool = False,
+    alpha: float = 0.8,
+    tf_short: float | None = None,
+    steps_short: int | None = None,
+    cache_labels: bool = True,
+    isothermal: bool = False,
+    min_species: int | None = None,
+    max_species: int | None = None,
+    target_species: int | None = None,
+    generations: int = 60,
+    population: int = 40,
+    mutation: float = 0.25,
+    focus: str = "auto",
+    focus_window: Tuple[float, float] | None = None,
+    report_grid: str | None = None,
+    *,
+    mode: str = "0d",
+    diluent: str = "N2",
+    L: float = 0.5,
+    D: float = 0.05,
+    mdot: float = 0.1,
+    U: float = 0.0,
+    Tw: float | None = None,
+    fitness_mode: str = "standard",
+    tol_pv: float = 0.05,
+    tol_delay: float = 0.05,
+    tol_timescale: float = 0.05,
+    tol_resid: float = 0.05,
+    plasma_length: float = 0.0,
+    T_plasma_out: float | None = None,
+    radical_seed: Dict[str, float] | None = None,
+    envelopes_path: str = "envelopes.json",
+) -> None:
+    if mode == "1d":
+        _full_pipeline_pfr(
+            mech_path,
+            out_dir,
+            steps=steps,
+            phi=phi,
+            T0=T0,
+            p0=p0,
+            log_times=log_times,
+            alpha=alpha,
+            tf_short=tf_short,
+            steps_short=steps_short,
+            cache_labels=cache_labels,
+            min_species=min_species,
+            max_species=max_species,
+            target_species=target_species,
+            generations=generations,
+            population=population,
+            mutation=mutation,
+            fitness_mode=fitness_mode,
+            tol_pv=tol_pv,
+            tol_delay=tol_delay,
+            tol_timescale=tol_timescale,
+            tol_resid=tol_resid,
+            diluent=diluent,
+            L=L,
+            D=D,
+            mdot=mdot,
+            U=U,
+            Tw=Tw,
+            plasma_length=plasma_length,
+            T_plasma_out=T_plasma_out,
+            radical_seed=radical_seed,
+            envelopes_path=envelopes_path,
+        )
+    else:
+        _full_pipeline_batch(
+            mech_path,
+            out_dir,
+            steps=steps,
+            tf=tf,
+            phi=phi,
+            preset=preset,
+            T0=T0,
+            p0=p0,
+            log_times=log_times,
+            alpha=alpha,
+            tf_short=tf_short,
+            steps_short=steps_short,
+            cache_labels=cache_labels,
+            isothermal=isothermal,
+            min_species=min_species,
+            max_species=max_species,
+            target_species=target_species,
+            generations=generations,
+            population=population,
+            mutation=mutation,
+            focus=focus,
+            focus_window=focus_window,
+            report_grid=report_grid,
+        )
+

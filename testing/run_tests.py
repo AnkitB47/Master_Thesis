@@ -23,6 +23,17 @@ def main():
     parser.add_argument("--p0", type=float, default=float(ct.one_atm), help="Initial pressure [Pa]")
     parser.add_argument("--log-times", action="store_true", help="Use log-spaced time sampling")
     parser.add_argument("--isothermal", action="store_true", help="Use isothermal reactor for HR presets")
+    parser.add_argument("--mode", choices=["0d", "1d"], default="0d", help="Reactor mode")
+    parser.add_argument("--diluent", default="N2", help="Diluent species for methane/air mixing")
+    parser.add_argument("--L", type=float, default=0.5, help="Reactor length [m]")
+    parser.add_argument("--D", type=float, default=0.05, help="Reactor diameter [m]")
+    parser.add_argument("--mdot", type=float, default=0.1, help="Mass flow [kg/s]")
+    parser.add_argument("--U", type=float, default=0.0, help="Overall heat transfer coefficient [W/m^2/K]")
+    parser.add_argument("--Tw", type=float, default=None, help="Wall temperature [K] for heat loss")
+    parser.add_argument("--plasma-length", type=float, default=0.0, help="Length of plasma zone [m]")
+    parser.add_argument("--T-plasma-out", type=float, default=None, help="Target temperature after plasma zone [K]")
+    parser.add_argument("--radical-seed", default=None, help="Comma-separated radicals (e.g. H:0.01,OH:0.005)")
+    parser.add_argument("--envelopes", default="envelopes.json", help="Envelope specification file")
 
     # === NEW ARGUMENTS for label building and aggressiveness ===
     parser.add_argument("--alpha", type=float, default=0.8, help="Weight between LOO and flux importance")
@@ -60,6 +71,19 @@ def main():
 
     args = parser.parse_args()
 
+    seed_dict = None
+    if args.radical_seed:
+        seed_dict = {}
+        for token in args.radical_seed.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            try:
+                name, value = token.split(":")
+                seed_dict[name.strip()] = float(value)
+            except ValueError:
+                raise ValueError(f"Invalid radical seed entry '{token}'. Use species:value format.")
+
     full_pipeline(
         args.mechanism,
         args.out,
@@ -84,6 +108,22 @@ def main():
         focus=args.focus,
         focus_window=tuple(args.focus_window) if args.focus_window else None,
         report_grid=args.report_grid,
+        mode=args.mode,
+        diluent=args.diluent,
+        L=args.L,
+        D=args.D,
+        mdot=args.mdot,
+        U=args.U,
+        Tw=args.Tw,
+        fitness_mode=args.fitness_mode,
+        tol_pv=args.tol_pv,
+        tol_delay=args.tol_delay,
+        tol_timescale=args.tol_timescale,
+        tol_resid=args.tol_resid,
+        plasma_length=args.plasma_length,
+        T_plasma_out=args.T_plasma_out,
+        radical_seed=seed_dict,
+        envelopes_path=args.envelopes,
     )
     print(f"\n✅ Pipeline complete. Results written to '{args.out}'\n")
 
