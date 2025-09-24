@@ -107,9 +107,28 @@ class PFRResult:
         tau = np.asarray(tau_samples, dtype=float)
         if tau.ndim != 1:
             raise ValueError("tau_samples must be 1-D")
-        mask = (tau >= self.residence_time[0]) & (tau <= self.residence_time[-1])
-        if not np.all(mask):
-            tau = np.clip(tau, self.residence_time[0], self.residence_time[-1])
+        # clamp to available window
+        t0, t1 = float(self.residence_time[0]), float(self.residence_time[-1])
+        tau = np.clip(tau, t0, t1)
+
+        # pathological time grids fallback: nearest sampling
+        if not np.all(np.diff(self.residence_time) > 0):
+            idx = np.searchsorted(self.residence_time, tau, side="left")
+            idx = np.clip(idx, 0, len(self.residence_time) - 1)
+            x = self.x[idx]
+            T = self.temperature[idx]
+            Y = self.mass_fractions[idx]
+            return _postprocess_result(
+                tau,
+                x,
+                T,
+                Y,
+                list(self.species_names),
+                self.molecular_weights,
+                self.initial_mass_fractions,
+                self.initial_mole_fractions,
+            )
+
         x = np.interp(tau, self.residence_time, self.x)
         T = np.interp(tau, self.residence_time, self.temperature)
         Y = np.zeros((len(tau), self.mass_fractions.shape[1]))
@@ -138,8 +157,36 @@ def _postprocess_result(
     initial_mole_fractions: np.ndarray,
 ) -> PFRResult:
     names = list(species_names)
-    dTdx = np.gradient(temperature, x, edge_order=2)
-    ign_idx = int(np.argmax(dTdx))
+
+    # --- enforce strictly increasing x & drop bad points
+    x = np.asarray(x, dtype=float)
+    temperature = np.asarray(temperature, dtype=float)
+    mass_fractions = np.asarray(mass_fractions, dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(temperature)
+    if mass_fractions.ndim == 2:
+        mask &= np.isfinite(mass_fractions).all(axis=1)
+    x = x[mask]
+    temperature = temperature[mask]
+    mass_fractions = mass_fractions[mask]
+    tau = np.asarray(tau, dtype=float)[mask]
+
+    if x.size >= 2:
+        keep = np.concatenate(([True], np.diff(x) > 1e-12))
+        x = x[keep]
+        temperature = temperature[keep]
+        mass_fractions = mass_fractions[keep]
+        tau = tau[keep]
+        # tiny monotonic enforce
+        x = np.maximum.accumulate(x)
+
+    # safe gradient
+    if len(x) >= 3 and (x[-1] - x[0]) > 0:
+        dTdx = np.gradient(temperature, x, edge_order=2)
+    else:
+        dTdx = np.zeros_like(x)
+
+    ign_idx = int(np.argmax(dTdx)) if len(dTdx) else 0
 
     X = _mass_to_mole(mass_fractions, molecular_weights)
     idx = {s: i for i, s in enumerate(names)}
@@ -204,34 +251,53 @@ def run_pfr(
         T = float(state[0])
         Y = state[1:-1]
         x = float(state[-1])
+
+        # --- safe normalisation & state clamping
         Y = np.clip(Y, 0.0, None)
         s = Y.sum()
-        if s <= 0:
+        if not np.isfinite(s) or s <= 1e-20:
             Y = initial_mass.copy()
             s = Y.sum()
         Y = Y / s
+        T = float(np.clip(T, 200.0, 4000.0))
+
         gas.TPY = T, p_oper, Y
-        rho = gas.density
-        cp = gas.cp_mass
+        rho = max(gas.density, 1e-6)   # avoid nonpositive density
+        cp = max(gas.cp_mass, 1e-3)
+
+        # chemistry
         wdot = gas.net_production_rates  # kmol/m^3/s
         heat_release = -np.dot(gas.partial_molar_enthalpies, wdot)  # -Σ h ω̇
         dTdtau = heat_release / (rho * cp)
+
+        # heat loss to wall
         if enable_heat_loss:
             dTdtau -= (
-                config.heat_transfer_coeff
-                * config.perimeter
-                / (rho * config.area * cp)
+                config.heat_transfer_coeff * config.perimeter / (rho * config.area * cp)
             ) * (T - tw_fun(x))
+
         u = config.mass_flow / (rho * config.area)
-        if config.plasma_length > 0 and x < config.plasma_length and config.plasma_temperature is not None:
-            slope = (config.plasma_temperature - plasma_T0) / max(config.plasma_length, 1e-9)
-            dTdtau += slope * u
+
+        # smooth plasma heating (logistic ramp across plasma zone)
+        if config.plasma_length > 0 and config.plasma_temperature is not None:
+            Lp = max(config.plasma_length, 1e-6)
+            xmid = 0.5 * Lp
+            k = 12.0 / Lp
+            frac = 1.0 / (1.0 + np.exp(-k * (x - xmid)))
+            T_tar = plasma_T0 + (config.plasma_temperature - plasma_T0) * np.clip(frac, 0.0, 1.0)
+            dTdx_plasma = np.clip(T_tar - T, -800.0, 800.0) / max(Lp / 2.0, 1e-6)
+            dTdtau += dTdx_plasma * u
+
         dYdtau = (wdot * gas.molecular_weights) / rho
         dxdtau = u
+
+        # cap total heating/cooling rate to avoid numeric blow-up
+        dTdtau = float(np.clip(dTdtau, -5e6, 5e6))
+
         return np.concatenate(([dTdtau], dYdtau, [dxdtau]))
 
     state0 = np.concatenate(([T0], Y_init, [0.0]))
-    rho0 = gas.density
+    rho0 = max(gas.density, 1e-6)
     u0 = config.mass_flow / (rho0 * config.area)
     tau_guess = config.length / max(u0, 1e-12)
     t_end = config.max_residence_time or (5.0 * tau_guess)
@@ -246,12 +312,13 @@ def run_pfr(
         (0.0, t_end),
         state0,
         method="BDF",
-        atol=1e-18,
-        rtol=1e-8,
+        atol=1e-12,           # relaxed from 1e-18
+        rtol=1e-6,            # relaxed from 1e-8
         events=event,
         dense_output=False,
-        max_step=t_end / max(points, 50),
+        max_step=min(t_end / max(points, 200), 5e-3),  # hard cap
     )
+
     if sol.y.shape[1] < 2:
         raise RuntimeError("PFR integration failed: insufficient points")
 
@@ -266,9 +333,7 @@ def run_pfr(
             tau_grid,
             np.interp(tau_grid, tau, x),
             np.interp(tau_grid, tau, T),
-            np.column_stack([
-                np.interp(tau_grid, tau, Y[:, j]) for j in range(Y.shape[1])
-            ]),
+            np.column_stack([np.interp(tau_grid, tau, Y[:, j]) for j in range(Y.shape[1])]),
             gas.species_names,
             molecular_weights,
             initial_mass,

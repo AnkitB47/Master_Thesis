@@ -7,6 +7,7 @@ import pandas as pd
 import cantera as ct
 
 from typing import Sequence, Dict, Tuple, List, Callable
+from reactor import PFRRunner, PFRConfig
 
 from mechanism.loader import Mechanism
 from mechanism.mix import methane_air_mole_fractions, mole_to_mass_fractions, HR_PRESETS

@@ -12,6 +12,13 @@ def methane_air_mole_fractions(phi: float, diluent: str = "N2") -> Dict[str, flo
     s = sum(x.values())
     return {k: v / s for k, v in x.items()}
 
+def methane_oxygen_mole_fractions(phi: float) -> dict[str, float]:
+    # CH4 + 2 O2 (stoich); for phi>1 rich, O2 reduced
+    CH4 = 1.0
+    O2_stoich = 2.0
+    O2 = O2_stoich / max(phi, 1e-6)
+    tot = CH4 + O2
+    return {"CH4": CH4/tot, "O2": O2/tot}
 
 def mole_to_mass_fractions(sol: ct.Solution, x: Dict[str, float]) -> Dict[str, float]:
     """Convert mole-fraction mapping ``x`` to a mass-fraction dict."""
