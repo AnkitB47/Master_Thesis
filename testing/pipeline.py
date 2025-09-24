@@ -10,7 +10,7 @@ from typing import Sequence, Dict, Tuple, List, Callable
 from reactor import PFRRunner, PFRConfig
 
 from mechanism.loader import Mechanism
-from mechanism.mix import methane_air_mole_fractions, mole_to_mass_fractions, HR_PRESETS
+from mechanism.mix import methane_air_mole_fractions, methane_oxygen_mole_fractions, mole_to_mass_fractions, HR_PRESETS
 from reactor.batch import BatchResult, run_constant_pressure, run_isothermal_const_p
 from metaheuristics.ga import run_ga, GAOptions
 from progress_variable import PV_SPECIES_DEFAULT, pv_error_aligned
@@ -793,6 +793,9 @@ def _two_point_cases(name: str, env: dict) -> list[dict]:
     return cases
 
 
+# at top of testing/pipeline.py (imports section), make sure this exists:
+# from mechanism.mix import methane_air_mole_fractions, methane_oxygen_mole_fractions
+
 def _compose_feed(
     sol: ct.Solution,
     phi: float,
@@ -802,43 +805,130 @@ def _compose_feed(
     radical_seed: Dict[str, float] | None = None,
     co2_ratio: float | None = None,
 ) -> Dict[str, float]:
-    mix = methane_air_mole_fractions(phi, diluent=base_diluent)
-    dil_total = 0.0
+    """
+    Build inlet *mole-fraction* map, then convert to mass fractions for Cantera.
+    - base_diluent:
+        "OXY"  -> O2-blown (no carrier N2), uses methane_oxygen_mole_fractions(phi)
+        else   -> methane_air_mole_fractions(phi, diluent=base_diluent)  (e.g., N2/Ar/He)
+    - diluent_specs: [{"species":"H2O","fraction":{"nominal":0.30}}, ...]  fractions are *mole* basis
+    - radical_seed:  {"H":0.005, "OH":0.002}   (mole fractions)
+    - co2_ratio: enforce CO2 >= co2_ratio * CH4 (mole basis), if provided
+    """
+
+    # ---- 1) Choose baseline (O2-blown vs air-like) ----
+    try:
+        if str(base_diluent).upper() == "OXY":
+            mix = methane_oxygen_mole_fractions(phi)  # CH4 + O2 only (no N2 carrier)
+        else:
+            mix = methane_air_mole_fractions(phi, diluent=base_diluent)  # CH4 + O2 + (carrier)
+    except Exception as e:
+        logger.warning("Baseline mixing failed with '%s': %s. Falling back to methane_air (N2).",
+                       base_diluent, e)
+        mix = methane_air_mole_fractions(phi, diluent="N2")
+
+    # Sanity: keep only species present in mechanism
+    mech_species = set(sol.species_names)
+    mix = {sp: float(x) for sp, x in mix.items() if sp in mech_species and x > 0.0}
+
+    # ---- 2) Accumulate envelope diluents on mole basis ----
     dil_map: Dict[str, float] = {}
-    for item in diluent_specs:
-        frac = item.get("fraction", {}).get("nominal") if isinstance(item.get("fraction"), dict) else None
-        if frac is None:
+    dil_total = 0.0
+    for item in (diluent_specs or []):
+        if not isinstance(item, dict):
             continue
-        val = float(frac)
-        if val <= 0:
-            continue
-        species = item.get("species", "")
-        if not species:
-            continue
-        dil_map[species] = dil_map.get(species, 0.0) + val
-        dil_total += val
+        species = str(item.get("species", "")).strip()
+        frac = item.get("fraction", {})
+        val = None
+        if isinstance(frac, dict):
+            val = frac.get("nominal", None)
+        if species and (val is not None):
+            try:
+                v = float(val)
+            except Exception:
+                continue
+            if v <= 0.0:
+                continue
+            if species not in mech_species:
+                logger.warning("Diluent '%s' not in mechanism; skipping.", species)
+                continue
+            dil_map[species] = dil_map.get(species, 0.0) + v
+            dil_total += v
 
-    seed_total = sum(radical_seed.values()) if radical_seed else 0.0
-    if dil_total + seed_total > 0.99:
-        logger.warning("Diluent + seed fractions %.2f exceed unity; scaling base fuel portion", dil_total + seed_total)
+    # ---- 3) Radical seeds (optional) on mole basis ----
+    seed_map = {}
+    if radical_seed:
+        for sp, v in radical_seed.items():
+            try:
+                vv = float(v)
+            except Exception:
+                continue
+            if vv <= 0.0:
+                continue
+            if sp not in mech_species:
+                logger.warning("Radical seed '%s' not in mechanism; skipping.", sp)
+                continue
+            seed_map[sp] = seed_map.get(sp, 0.0) + vv
+    seed_total = float(sum(seed_map.values()))
+
+    # ---- 4) Prevent overfill (diluent + seed >= 1). Scale down proportionally. ----
+    over = dil_total + seed_total
+    if over >= 0.999:
+        if over <= 0.0:
+            scale = 1.0
+        else:
+            scale = 0.999 / over
+        if scale < 1.0:
+            logger.warning("Diluent+seed (%.3f) exceeds unity; scaling both by %.3f.", over, scale)
+            for sp in list(dil_map.keys()):
+                dil_map[sp] *= scale
+            for sp in list(seed_map.keys()):
+                seed_map[sp] *= scale
+            dil_total = sum(dil_map.values())
+            seed_total = sum(seed_map.values())
+
+    # ---- 5) Compose final mole fractions: base gets the remainder ----
     base_fraction = max(1e-6, 1.0 - dil_total - seed_total)
+    scaled: Dict[str, float] = {}
+    for sp, val in mix.items():
+        scaled[sp] = val * base_fraction
 
-    scaled = {sp: val * base_fraction for sp, val in mix.items()}
+    # add diluents
     for sp, frac in dil_map.items():
         scaled[sp] = scaled.get(sp, 0.0) + frac
-    if radical_seed:
-        for sp, frac in radical_seed.items():
-            scaled[sp] = scaled.get(sp, 0.0) + frac
+    # add radicals
+    for sp, frac in seed_map.items():
+        scaled[sp] = scaled.get(sp, 0.0) + frac
 
-    if co2_ratio is not None and co2_ratio > 0 and "CH4" in scaled:
-        ch4 = scaled["CH4"]
+    # ---- 6) Optional CO2/CH4 ratio enforcement (mole basis) ----
+    if (co2_ratio is not None) and (co2_ratio > 0.0) and ("CH4" in scaled):
+        ch4 = max(scaled.get("CH4", 0.0), 0.0)
         target = co2_ratio * ch4
-        scaled["CO2"] = max(scaled.get("CO2", 0.0), target)
+        if target > 0.0:
+            scaled["CO2"] = max(scaled.get("CO2", 0.0), target)
 
-    total = sum(scaled.values())
-    if total <= 0:
-        raise ValueError("Mixture fractions sum to zero")
-    scaled = {k: v / total for k, v in scaled.items()}
+    # ---- 7) Clean-up, normalize mole fractions ----
+    # remove tiny negatives / numerical noise
+    for sp, v in list(scaled.items()):
+        if not np.isfinite(v) or v <= 0.0:
+            scaled.pop(sp, None)
+    total = float(sum(scaled.values()))
+    if total <= 0.0:
+        raise ValueError("Mixture fractions sum to zero after composition.")
+    scaled = {k: float(v) / total for k, v in scaled.items()}
+
+    # Final guard: ensure fuel & oxidizer exist in some amount
+    if "CH4" not in scaled:
+        logger.warning("No CH4 present after composition; injecting a tiny fuel tracer.")
+        scaled["CH4"] = 1e-6
+    if "O2" not in scaled and any(sp in scaled for sp in ("NO2", "N2O", "O", "OH")) is False:
+        # only warn when truly zero oxidizer-ish species
+        logger.warning("No O2 (or oxidizer radical) present; adding tiny O2 tracer.")
+        scaled["O2"] = scaled.get("O2", 0.0) + 1e-6
+        # renormalize
+        s = float(sum(scaled.values()))
+        scaled = {k: v / s for k, v in scaled.items()}
+
+    # ---- 8) Convert mole -> mass fractions for Cantera ----
     return mole_to_mass_fractions(sol, scaled)
 
 
