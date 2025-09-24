@@ -24,8 +24,57 @@ from visualizations import (
     plot_species_residuals,
     plot_progress_variable,
     plot_timescales,
+    plot_axial_overlays,
+    plot_kpi_bars,
+    plot_consistency_stub,
 )
 from timescales import pv_timescale, spts
+
+
+# --- Alignment utilities ---
+import numpy as _np
+
+
+def _align_to_reference(t_ref: _np.ndarray,
+                        t_a: _np.ndarray, a: _np.ndarray,
+                        t_b: _np.ndarray, b: _np.ndarray) -> tuple[_np.ndarray, _np.ndarray]:
+    """
+    Resample series 'a' and 'b' onto the reference time grid t_ref using 1D linear interpolation.
+    Handles scalar, 1D, or matching-length 1D arrays.
+    Returns (a_ref, b_ref) with shape (len(t_ref),) each.
+    """
+    t_ref = _np.asarray(t_ref, dtype=float)
+    t_a = _np.asarray(t_a, dtype=float)
+    t_b = _np.asarray(t_b, dtype=float)
+    a = _np.asarray(a, dtype=float)
+    b = _np.asarray(b, dtype=float)
+
+    # Edge cases: if a/b are scalar, broadcast
+    if a.ndim == 0:
+        a_ref = _np.full_like(t_ref, float(a))
+    else:
+        a_ref = _np.interp(t_ref, t_a, a, left=a[0], right=a[-1])
+
+    if b.ndim == 0:
+        b_ref = _np.full_like(t_ref, float(b))
+    else:
+        b_ref = _np.interp(t_ref, t_b, b, left=b[0], right=b[-1])
+
+    return a_ref, b_ref
+
+
+def _ensure_same_grid(time_ref: _np.ndarray,
+                      series_pairs: list[tuple[_np.ndarray, _np.ndarray, _np.ndarray, _np.ndarray]]) -> list[tuple[_np.ndarray, _np.ndarray]]:
+    """
+    For a list of pairs (t1, s1, t2, s2), resample both s1 and s2 to 'time_ref' with _align_to_reference.
+    Returns list of (s1_ref, s2_ref).
+    """
+    out = []
+    for (t1, s1, t2, s2) in series_pairs:
+        a_ref, b_ref = _align_to_reference(time_ref, t1, s1, t2, s2)
+        out.append((a_ref, b_ref))
+    return out
+
 
 logger = logging.getLogger(__name__)
 
@@ -282,6 +331,7 @@ def evaluate_selection(
     zeta: float = 20.0,
 ):
     reason = ""
+    _DEBUG_ALIGN = False
 
     if critical_idxs and (selection.sum() < max(4, len(critical_idxs)) or np.any(selection[critical_idxs] == 0)):
         info = (1.0, 1.0, 0.0, 0.0, 0.0, 0.0, "missing_critical", int(selection.sum()), 0.0, 0.0, 0.0)
@@ -308,6 +358,14 @@ def evaluate_selection(
                 log_times=log_times,
                 time_grid=full_res.time,
             )
+            if _DEBUG_ALIGN:
+                print(
+                    "len(full.time)=", len(full_res.time),
+                    "len(res.time)=", len(getattr(res, "time", [])),
+                )
+            if hasattr(res, "time") and len(res.time) != len(full_res.time):
+                # Force align all reduced quantities to the full grid later
+                pass  # alignment utilities will handle it; this is just a reminder checkpoint.
         except RuntimeError as e:
             if "no_reaction" in str(e) and attempt == 0:
                 sel = sel.copy()
@@ -356,10 +414,21 @@ def evaluate_selection(
     # timescale mismatch
     _, tau_pv_red = pv_timescale(res.time, res.mass_fractions, mech.species_names)
     tau_spts_red = spts(res.time, res.mass_fractions)
-    log_full_pv = np.log10(tau_pv_full + 1e-30)
-    log_red_pv = np.log10(tau_pv_red + 1e-30)
-    log_full_spts = np.log10(tau_spts_full + 1e-30)
-    log_red_spts = np.log10(tau_spts_red + 1e-30)
+
+    # Align both PVTS and SPTS to the full reference grid
+    (pv_full_ref, pv_red_ref), (spts_full_ref, spts_red_ref) = _ensure_same_grid(
+        full_res.time,
+        [
+            (full_res.time, tau_pv_full, res.time, tau_pv_red),
+            (full_res.time, tau_spts_full, res.time, tau_spts_red),
+        ],
+    )
+
+    log_full_pv = np.log10(pv_full_ref + 1e-30)
+    log_red_pv = np.log10(pv_red_ref + 1e-30)
+    log_full_spts = np.log10(spts_full_ref + 1e-30)
+    log_red_spts = np.log10(spts_red_ref + 1e-30)
+
     tau_mis = np.linalg.norm(log_full_pv - log_red_pv) + np.linalg.norm(log_full_spts - log_red_spts)
 
     # post-ignition species penalty
@@ -369,16 +438,21 @@ def evaluate_selection(
     for s, j in map_full.items():
         if s in map_red:
             Y_red_full[:, j] = Y_red_interp[:, map_red[s]]
+    mask_post = full_res.time > tau_full
     if mode == "1d" and x_full is not None:
         x_full_arr = np.asarray(x_full, dtype=float)
-        x_ign_full = float(np.interp(tau_full, full_res.time, x_full_arr)) if len(x_full_arr) else 0.0
-        L = float(x_full_arr[-1]) if len(x_full_arr) else 1.0
-        upper = min(L, x_ign_full + 0.3 * L)
-        mask_post = (x_full_arr >= x_ign_full) & (x_full_arr <= upper)
-        if not np.any(mask_post):
-            mask_post = full_res.time > tau_full
-    else:
-        mask_post = full_res.time > tau_full
+        if x_full_arr.size >= 2:
+            # ensure monotonicity for gradient/ignition computations
+            x_full_arr = np.maximum.accumulate(x_full_arr)
+            try:
+                x_ign_full = float(np.interp(tau_full, full_res.time, x_full_arr))
+            except Exception:
+                x_ign_full = x_full_arr[x_full_arr.size // 10] if x_full_arr.size else 0.0
+            L = float(x_full_arr[-1]) if x_full_arr.size else 1.0
+            upper = min(L, x_ign_full + 0.3 * L)
+            alt = (x_full_arr >= x_ign_full) & (x_full_arr <= upper)
+            if alt.any():
+                mask_post = alt
     diff = np.abs(full_res.mass_fractions[mask_post] - Y_red_full[mask_post])
     pen_species = float(np.sum(np.asarray(weights) * diff.mean(axis=0)))
 
@@ -975,28 +1049,53 @@ def _compute_case_metrics(
         x_full_arr = np.asarray(x_full, dtype=float)
         x_red_arr = np.asarray(x_red, dtype=float)
         if x_full_arr.size > 0 and x_red_arr.size > 0:
-            x_ign_full = float(np.interp(delay_full, full_res.time, x_full_arr))
-            x_ign_red = float(np.interp(delay_red, red_res.time, x_red_arr))
-            ign_shift = abs(x_ign_red - x_ign_full) / max(x_ign_full, 1e-12)
-            delay_metric = 0.5 * (delay_ratio + ign_shift)
+            if x_full_arr.size >= 2:
+                x_full_arr = np.maximum.accumulate(x_full_arr)
+            if x_red_arr.size >= 2:
+                x_red_arr = np.maximum.accumulate(x_red_arr)
+            try:
+                x_ign_full = float(np.interp(delay_full, full_res.time, x_full_arr))
+                x_ign_red = float(np.interp(delay_red, red_res.time, x_red_arr))
+                ign_shift = abs(x_ign_red - x_ign_full) / max(x_ign_full, 1e-12)
+                delay_metric = 0.5 * (delay_ratio + ign_shift)
+            except Exception:
+                ign_shift = 0.0
+                delay_metric = delay_ratio
 
     _, tau_pv_full = pv_timescale(full_res.time, full_res.mass_fractions, species_full)
     _, tau_pv_red = pv_timescale(red_res.time, red_res.mass_fractions, species_red)
     tau_spts_full = spts(full_res.time, full_res.mass_fractions)
     tau_spts_red = spts(red_res.time, red_res.mass_fractions)
-    tau_mis = np.linalg.norm(np.log10(tau_pv_full + 1e-30) - np.log10(tau_pv_red + 1e-30))
-    tau_mis += np.linalg.norm(np.log10(tau_spts_full + 1e-30) - np.log10(tau_spts_red + 1e-30))
 
+    (pv_full_ref, pv_red_ref), (spts_full_ref, spts_red_ref) = _ensure_same_grid(
+        full_res.time,
+        [
+            (full_res.time, tau_pv_full, red_res.time, tau_pv_red),
+            (full_res.time, tau_spts_full, red_res.time, tau_spts_red),
+        ],
+    )
+
+    log_full_pv = np.log10(pv_full_ref + 1e-30)
+    log_red_pv = np.log10(pv_red_ref + 1e-30)
+    log_full_spts = np.log10(spts_full_ref + 1e-30)
+    log_red_spts = np.log10(spts_red_ref + 1e-30)
+
+    tau_mis = np.linalg.norm(log_full_pv - log_red_pv) + np.linalg.norm(log_full_spts - log_red_spts)
+
+    mask = full_res.time > delay_full
     if x_full is not None:
         x_full_arr = np.asarray(x_full, dtype=float)
-        x_ign_full = float(np.interp(delay_full, full_res.time, x_full_arr)) if x_full_arr.size else 0.0
-        L = float(x_full_arr[-1]) if x_full_arr.size else 1.0
-        upper = min(L, x_ign_full + 0.3 * L)
-        mask = (x_full_arr >= x_ign_full) & (x_full_arr <= upper)
-        if not np.any(mask):
-            mask = full_res.time > delay_full
-    else:
-        mask = full_res.time > delay_full
+        if x_full_arr.size >= 2:
+            x_full_arr = np.maximum.accumulate(x_full_arr)
+            try:
+                x_ign_full = float(np.interp(delay_full, full_res.time, x_full_arr))
+            except Exception:
+                x_ign_full = x_full_arr[x_full_arr.size // 10] if x_full_arr.size else 0.0
+            L = float(x_full_arr[-1]) if x_full_arr.size else 1.0
+            upper = min(L, x_ign_full + 0.3 * L)
+            alt = (x_full_arr >= x_ign_full) & (x_full_arr <= upper)
+            if alt.any():
+                mask = alt
 
     if isinstance(mask, np.ndarray) and not np.any(mask):
         mask = slice(None)

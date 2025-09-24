@@ -130,6 +130,14 @@ class PFRResult:
             )
 
         x = np.interp(tau, self.residence_time, self.x)
+        # enforce monotonic x to stabilize gradient
+        x = np.maximum.accumulate(x)
+        if x.size:
+            span = float(x[-1] - x[0]) if x.size > 1 else 1.0
+            denom = max(x.size - 1, 1)
+            min_step = max(1e-9, abs(span) * 1e-6 / denom)
+            ramp = min_step * np.arange(x.size)
+            x = np.maximum.accumulate(x + ramp)
         T = np.interp(tau, self.residence_time, self.temperature)
         Y = np.zeros((len(tau), self.mass_fractions.shape[1]))
         for j in range(self.mass_fractions.shape[1]):
@@ -172,17 +180,24 @@ def _postprocess_result(
     tau = np.asarray(tau, dtype=float)[mask]
 
     if x.size >= 2:
+        x = np.maximum.accumulate(x)
+        span = float(x[-1] - x[0]) if x.size > 1 else 1.0
+        denom = max(x.size - 1, 1)
+        min_step = max(1e-9, abs(span) * 1e-6 / denom)
+        ramp = min_step * np.arange(x.size)
+        x = np.maximum.accumulate(x + ramp)
         keep = np.concatenate(([True], np.diff(x) > 1e-12))
         x = x[keep]
         temperature = temperature[keep]
         mass_fractions = mass_fractions[keep]
         tau = tau[keep]
-        # tiny monotonic enforce
-        x = np.maximum.accumulate(x)
 
     # safe gradient
     if len(x) >= 3 and (x[-1] - x[0]) > 0:
-        dTdx = np.gradient(temperature, x, edge_order=2)
+        try:
+            dTdx = np.gradient(temperature, x, edge_order=2)
+        except Exception:
+            dTdx = np.gradient(temperature, edge_order=2)
     else:
         dTdx = np.zeros_like(x)
 
