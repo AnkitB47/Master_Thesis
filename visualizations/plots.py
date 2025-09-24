@@ -304,3 +304,93 @@ def plot_timescales(
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(frameon=False, ncol=2)
     _save(fig, out_base)
+
+
+def plot_axial_overlays(cases: Sequence[dict], species: Sequence[str], out_base: str) -> None:
+    if not cases:
+        fig, ax = plt.subplots()
+        ax.text(0.5, 0.5, "No cases to plot", ha="center", va="center")
+        ax.axis("off")
+        _save(fig, out_base)
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    for data in cases:
+        x = np.asarray(data.get("x", []), dtype=float)
+        if x.size == 0:
+            continue
+        axes[0].plot(x, data.get("T_full", []), label=f"{data['id']} full")
+        axes[0].plot(x, data.get("T_red", []), linestyle="--", label=f"{data['id']} red")
+        axes[0].axvline(data.get("ign_full", np.nan), color="0.6", ls=":", alpha=0.5)
+        axes[0].axvline(data.get("ign_red", np.nan), color="0.3", ls="--", alpha=0.5)
+
+    axes[0].set_xlabel("Axial coordinate [m]")
+    axes[0].set_ylabel("Temperature [K]")
+    axes[0].legend(ncol=2, frameon=False)
+    axes[0].grid(True, alpha=0.3)
+
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    for i, sp in enumerate(species):
+        color = colors[i % len(colors)]
+        for data in cases:
+            spec = data.get("species", {}).get(sp)
+            if not spec:
+                continue
+            axes[1].plot(data["x"], spec[0], color=color, alpha=0.8, label=f"{sp} {data['id']} full")
+            axes[1].plot(data["x"], spec[1], color=color, linestyle="--", alpha=0.6, label=f"{sp} {data['id']} red")
+
+    axes[1].set_xlabel("Axial coordinate [m]")
+    axes[1].set_ylabel("Mass fraction")
+    if cases:
+        axes[1].legend(ncol=2, frameon=False, fontsize=8)
+    axes[1].grid(True, alpha=0.3)
+    _save(fig, out_base)
+
+
+def plot_kpi_bars(df, out_base: str) -> None:
+    if df is None or df.empty:
+        fig, ax = plt.subplots()
+        ax.text(0.5, 0.5, "No KPI data", ha="center", va="center")
+        ax.axis("off")
+        _save(fig, out_base)
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    idx = np.arange(len(df))
+    width = 0.35
+
+    axes[0].bar(idx - width / 2, df["CH4_full"], width, label="Full")
+    axes[0].bar(idx + width / 2, df["CH4_red"], width, label="Reduced")
+    axes[0].set_xticks(idx)
+    axes[0].set_xticklabels(df["case_id"], rotation=45, ha="right")
+    axes[0].set_ylabel("CH4 conversion")
+    axes[0].legend(frameon=False)
+    axes[0].grid(axis="y", alpha=0.3)
+
+    axes[1].bar(idx - width / 2, df["H2CO_full"], width, label="Full")
+    axes[1].bar(idx + width / 2, df["H2CO_red"], width, label="Reduced")
+    axes[1].set_xticks(idx)
+    axes[1].set_xticklabels(df["case_id"], rotation=45, ha="right")
+    axes[1].set_ylabel("H$_2$/CO ratio")
+    axes[1].legend(frameon=False)
+    axes[1].grid(axis="y", alpha=0.3)
+
+    fig.tight_layout()
+    _save(fig, out_base)
+
+
+def plot_consistency_stub(df, out_base: str, baseline) -> None:
+    fig, ax = plt.subplots()
+    if baseline is None or df is None or df.empty:
+        ax.text(0.5, 0.5, "No 0D baseline available", ha="center", va="center")
+        ax.axis("off")
+        _save(fig, out_base)
+        return
+
+    ax.scatter(df["CH4_full"], df["CH4_red"], label="Cases")
+    ax.plot([0, 1], [0, 1], "k--", label="1:1")
+    ax.set_xlabel("1D full CH4 conversion")
+    ax.set_ylabel("1D reduced CH4 conversion")
+    ax.legend(frameon=False)
+    ax.grid(True, alpha=0.3)
+    _save(fig, out_base)

@@ -35,6 +35,42 @@ python -m testing.run_tests --mechanism data/gri30.yaml --out results --steps 20
 
 ---
 
+## 🧵 1D Plug-Flow Reactor mode (WP2/WP5/WP6)
+
+`--mode 1d` activates a tubular plug-flow reactor (PFR) with optional heat loss and plasma surrogates. The pipeline reads
+`envelopes.json` to sample POX/HP-POX/CO₂-recycle operating windows, runs GA–GNN reduction under threshold fitness, and
+emits additional artefacts:
+
+* `pfr_profiles.csv` – axial temperature/species overlays (full vs. reduced) for all sampled cases.
+* `pfr_kpis.csv` – CH₄/CO₂ conversion, H₂/CO ratios, ignition length, and pass/fail metrics per case.
+* `robustness_1d.csv` / `robustness_plasma.csv` – threshold-metric audits for POX and plasma envelopes.
+* `results/latex/robustness_pox.tex`, `results/latex/robustness_plasma.tex`, `results/latex/kpi_summary.tex` – tables ready for
+  direct inclusion in WP reports.
+* `visualizations/axial_overlay` & `visualizations/kpi_bars` – axial profile overlays (with ignition markers) and KPI bar charts
+  across the envelope sweep.
+
+### Minimal 1D examples
+
+```bash
+# POX nominal (adiabatic, φ=0.7, 10 bar, 700 K)
+python -m testing.run_tests \
+  --mode 1d --mechanism data/gri30.yaml --out results/pox_nominal \
+  --phi 0.7 --T0 700 --p0 1.0e6 --L 0.8 --D 0.05 --mdot 0.12 --U 0.0 \
+  --steps 400 --fitness-mode threshold --tol-pv 0.05 --tol-delay 0.05 --tol-timescale 0.05 --tol-resid 0.05
+
+# Plasma surrogate (torch heating to 1500 K with radical seeding)
+python -m testing.run_tests \
+  --mode 1d --mechanism data/gri30.yaml --out results/plasma_demo \
+  --phi 1.0 --T0 400 --p0 2.0e5 --L 0.6 --D 0.04 --mdot 0.08 \
+  --plasma-length 0.1 --T-plasma-out 1500 --radical-seed "H:0.005,OH:0.002" \
+  --steps 400 --fitness-mode threshold --tol-pv 0.05 --tol-delay 0.05 --tol-timescale 0.05 --tol-resid 0.05
+```
+
+Both commands populate the additional PFR CSVs, plots, and LaTeX tables described above while keeping the GA–GNN reduction
+workflow consistent with the 0D baseline.
+
+---
+
 ## 🧠 GNN Integration
 
 The GNN model is trained on species graph constructed from Cantera with:

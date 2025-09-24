@@ -4,6 +4,7 @@ from .batch import BatchResult, run_constant_pressure, run_constant_volume
 from .piston import run_piston, PistonOptions
 from .network import run_network, Connection
 from .flame import counterflow_flame, CounterFlowOptions
+from .pfr import PFRConfig, PFRResult, PFRRunner, run_pfr
 
 __all__ = [
     "BatchResult",
@@ -15,4 +16,8 @@ __all__ = [
     "Connection",
     "counterflow_flame",
     "CounterFlowOptions",
+    "PFRConfig",
+    "PFRResult",
+    "PFRRunner",
+    "run_pfr",
 ]
