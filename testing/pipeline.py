@@ -35,57 +35,77 @@ from timescales import pv_timescale, spts
 import numpy as _np
 
 
-def _align_to_reference(t_ref: _np.ndarray,
-                        t_a: _np.ndarray, a: _np.ndarray,
-                        t_b: _np.ndarray, b: _np.ndarray) -> tuple[_np.ndarray, _np.ndarray]:
-    """
-    Resample series 'a' and 'b' onto the reference time grid t_ref using 1D linear interpolation.
-    Handles scalar, 1D, or matching-length 1D arrays.
-    Returns (a_ref, b_ref) with shape (len(t_ref),) each.
-    """
-    t_ref = _np.asarray(t_ref, dtype=float)
-    t_a = _np.asarray(t_a, dtype=float)
-    t_b = _np.asarray(t_b, dtype=float)
-    a = _np.asarray(a, dtype=float)
-    b = _np.asarray(b, dtype=float)
-
-    # Edge cases: if a/b are scalar, broadcast
-    if a.ndim == 0:
-        a_ref = _np.full_like(t_ref, float(a))
-    else:
-        a_ref = _np.interp(t_ref, t_a, a, left=a[0], right=a[-1])
-
-    if b.ndim == 0:
-        b_ref = _np.full_like(t_ref, float(b))
-    else:
-        b_ref = _np.interp(t_ref, t_b, b, left=b[0], right=b[-1])
-
-    return a_ref, b_ref
-
-
-def _ensure_same_grid(time_ref: _np.ndarray,
-                      series_pairs: list[tuple[_np.ndarray, _np.ndarray, _np.ndarray, _np.ndarray]]) -> list[tuple[_np.ndarray, _np.ndarray]]:
-    """
-    For a list of pairs (t1, s1, t2, s2), resample both s1 and s2 to 'time_ref' with _align_to_reference.
-    Returns list of (s1_ref, s2_ref).
-    """
-    out = []
-    for (t1, s1, t2, s2) in series_pairs:
-        a_ref, b_ref = _align_to_reference(time_ref, t1, s1, t2, s2)
-        out.append((a_ref, b_ref))
+def _ensure_strictly_increasing(grid: _np.ndarray) -> _np.ndarray:
+    grid = _np.asarray(grid, dtype=float)
+    if grid.ndim != 1:
+        raise ValueError("grids must be 1-D")
+    if grid.size < 2:
+        return grid
+    eps = max(abs(grid[-1] - grid[0]) * 1e-12, 1e-15)
+    out = grid.copy()
+    for i in range(1, len(out)):
+        if not _np.isfinite(out[i]) or out[i] <= out[i - 1]:
+            out[i] = out[i - 1] + eps
     return out
 
 
+def _prepare_series_grid(t: _np.ndarray, values: _np.ndarray) -> tuple[_np.ndarray, _np.ndarray]:
+    t_arr = _np.asarray(t, dtype=float)
+    vals = _np.asarray(values, dtype=float)
+    if vals.ndim > 0 and vals.shape[0] != t_arr.shape[0]:
+        raise ValueError("Series length mismatch during alignment")
+    if t_arr.size:
+        order = _np.argsort(t_arr, kind="mergesort")
+        if not _np.all(order == _np.arange(t_arr.size)):
+            t_arr = t_arr[order]
+            if vals.ndim > 0:
+                vals = vals[order]
+    t_arr = _ensure_strictly_increasing(t_arr)
+    return t_arr, vals
+
+
+def align_to(ref_t: _np.ndarray, t_other: _np.ndarray, *arrays: _np.ndarray) -> tuple[_np.ndarray, ...]:
+    """Resample ``arrays`` defined on ``t_other`` onto ``ref_t`` with monotonic guards."""
+
+    ref = _ensure_strictly_increasing(ref_t)
+    t_other_arr = _np.asarray(t_other, dtype=float)
+    if t_other_arr.ndim != 1:
+        raise ValueError("Input time grid must be 1-D")
+    prepared = [_np.asarray(arr, dtype=float) for arr in arrays]
+    if t_other_arr.size:
+        order = _np.argsort(t_other_arr, kind="mergesort")
+        if not _np.all(order == _np.arange(t_other_arr.size)):
+            t_other_arr = t_other_arr[order]
+            prepared = [arr if arr.ndim == 0 else arr[order] for arr in prepared]
+    t_other_arr = _ensure_strictly_increasing(t_other_arr)
+
+    aligned: list[_np.ndarray] = []
+    for arr in prepared:
+        if arr.ndim == 0:
+            aligned.append(_np.full(ref.shape, float(arr)))
+            continue
+        if arr.shape[0] != t_other_arr.shape[0]:
+            raise ValueError("Array/time grid mismatch during alignment")
+        if arr.ndim == 1:
+            aligned.append(_np.interp(ref, t_other_arr, arr, left=arr[0], right=arr[-1]))
+        else:
+            out = _np.zeros((ref.size, arr.shape[1]), dtype=float)
+            left = arr[0]
+            right = arr[-1]
+            for j in range(arr.shape[1]):
+                out[:, j] = _np.interp(ref, t_other_arr, arr[:, j], left=left[j], right=right[j])
+            aligned.append(out)
+    return tuple(aligned)
+
+
 def _interp_to(ref_t, y_t, y_vals):
-    """Interpolate ``y_vals`` defined on ``y_t`` onto ``ref_t`` column-wise."""
-    ref_t = np.asarray(ref_t, dtype=float)
-    y_t = np.asarray(y_t, dtype=float)
-    y_vals = np.asarray(y_vals, dtype=float)
-    if y_vals.ndim == 1:
-        return np.interp(ref_t, y_t, y_vals)
-    out = np.zeros((len(ref_t), y_vals.shape[1]), dtype=float)
-    for j in range(y_vals.shape[1]):
-        out[:, j] = np.interp(ref_t, y_t, y_vals[:, j])
+    ref_t = _ensure_strictly_increasing(ref_t)
+    y_t, y_vals_prepped = _prepare_series_grid(y_t, y_vals)
+    if y_vals_prepped.ndim == 1:
+        return _np.interp(ref_t, y_t, y_vals_prepped)
+    out = _np.zeros((len(ref_t), y_vals_prepped.shape[1]), dtype=float)
+    for j in range(y_vals_prepped.shape[1]):
+        out[:, j] = _np.interp(ref_t, y_t, y_vals_prepped[:, j])
     return out
 
 
@@ -211,7 +231,7 @@ def _loo_scores(
             m.remove_species([s])
             red = _baseline_short_run(m, T0, p0, Y0, tf_short, steps_short, log_times, runner)
 
-            red_interp = _interp_to(baseline.time, red.time, red.mass_fractions)
+            (red_interp,) = align_to(baseline.time, red.time, red.mass_fractions)
             score = pv_error_aligned(
                 baseline.mass_fractions,
                 red_interp,
@@ -400,7 +420,7 @@ def evaluate_selection(
         break
 
     # interpolate reduced onto full time grid for penalties
-    Y_red_interp = _interp_to(full_res.time, res.time, res.mass_fractions)
+    (Y_red_interp,) = align_to(full_res.time, res.time, res.mass_fractions)
     weights_arr = np.asarray(weights, dtype=float)
 
     err = pv_error_aligned(
@@ -429,15 +449,17 @@ def evaluate_selection(
             delay_metric = delay_diff
     delta_T = float(res.temperature[-1] - res.temperature[0])
     delta_Y = float(np.max(np.abs(res.mass_fractions[-1] - res.mass_fractions[0])))
+    diagnostics = getattr(res, "diagnostics", {}) or {}
+    status = str(diagnostics.get("status", "ok"))
 
     # timescale mismatch
     _, tau_pv_red = pv_timescale(res.time, res.mass_fractions, mech.species_names)
     tau_spts_red = spts(res.time, res.mass_fractions)
 
     log_full_pv = np.log10(tau_pv_full + 1e-30)
-    log_red_pv = _interp_to(full_res.time, res.time, np.log10(tau_pv_red + 1e-30))
+    (log_red_pv,) = align_to(full_res.time, res.time, np.log10(tau_pv_red + 1e-30))
     log_full_spts = np.log10(tau_spts_full + 1e-30)
-    log_red_spts = _interp_to(full_res.time, res.time, np.log10(tau_spts_red + 1e-30))
+    (log_red_spts,) = align_to(full_res.time, res.time, np.log10(tau_spts_red + 1e-30))
 
     tau_mis = _rms_norm(log_full_pv - log_red_pv) + _rms_norm(log_full_spts - log_red_spts)
 
@@ -449,7 +471,7 @@ def evaluate_selection(
         idx_red = map_red.get(s)
         if idx_red is not None:
             Y_red_full[:, idx_full] = Y_red_interp[:, idx_red]
-    mask_post = full_res.time > tau_full
+    mask_post = full_res.time >= tau_full
     if mode == "1d" and x_full is not None:
         x_full_arr = np.asarray(x_full, dtype=float)
         if x_full_arr.size >= 2:
@@ -469,7 +491,7 @@ def evaluate_selection(
         if np.any(alt):
             mask_post = alt
     if isinstance(mask_post, np.ndarray) and not np.any(mask_post):
-        mask_post = full_res.time > tau_full
+        mask_post = full_res.time >= tau_full
         if isinstance(mask_post, np.ndarray) and not np.any(mask_post):
             mask_post = slice(None)
     diff = np.abs(full_res.mass_fractions[mask_post] - Y_red_full[mask_post])
@@ -482,6 +504,7 @@ def evaluate_selection(
         qpen = ((keep_cnt - target_species) / len(selection)) ** 2
         size_pen += 3.0 * qpen
 
+    inert_case = mode == "1d" and (delta_T < 5.0 or delta_Y < 1e-6 or status.lower() not in {"ok"})
     if fitness_mode == "threshold":
         ratios = (
             err / max(tol_pv, 1e-12),
@@ -490,7 +513,11 @@ def evaluate_selection(
             pen_species / max(tol_resid, 1e-12),
         )
         exceed = [max(0.0, r - 1.0) for r in ratios]
-        if any(val > 0.0 for val in exceed):
+        if inert_case:
+            reason = f"inert:{status}" if status and status.lower() != "ok" else "inert"
+            exceed = [max(v, 1.0) for v in exceed]
+            fitness = -1e6 * (sum(exceed) + 1.0) - size_pen
+        elif any(val > 0.0 for val in exceed):
             reason = "threshold_fail"
             fitness = -1e6 * sum(exceed) - size_pen
         else:
@@ -498,6 +525,9 @@ def evaluate_selection(
             fitness = 100.0 + margin - size_pen - 0.1 * tau_mis
     else:
         fitness = -(1.0 * err + 12.0 * delay_metric + 1.0 * tau_mis + zeta * pen_species + size_pen)
+        if inert_case:
+            reason = f"inert:{status}" if status and status.lower() != "ok" else "inert"
+            fitness -= 1e6
 
     info = (
         float(err),
@@ -544,6 +574,7 @@ def evaluate_selection_multi(
     target_species: int | None = None,
     zeta: float = 20.0,
     details: list[dict] | None = None,
+    integrator_mode: str = "ga_fast",
 ):
     if critical_idxs and (selection.sum() < max(4, len(critical_idxs)) or np.any(selection[critical_idxs] == 0)):
         info = (1.0, 1.0, 0.0, 0.0, 0.0, 0.0, "missing_critical", int(selection.sum()), 0.0, 0.0, 0.0)
@@ -588,6 +619,7 @@ def evaluate_selection_multi(
                 nsteps=steps_case,
                 use_mole=False,
                 time_grid=time_grid,
+                integrator_mode=integrator_mode,
             )
         except RuntimeError as e:
             reason = f"sim_failed:{entry.get('id', '?')}:{e}" if "no_reaction" not in str(e) else "no_reaction"
@@ -613,6 +645,25 @@ def evaluate_selection_multi(
         delta_Y = float(
             np.max(np.abs(red_case.mass_fractions[-1] - red_case.mass_fractions[0]))
         )
+        diagnostics = getattr(red_case, "diagnostics", {}) or {}
+        status = str(diagnostics.get("status", "ok"))
+        inert_case = (
+            delta_T < 5.0
+            or delta_Y < 1e-6
+            or status.lower() not in {"ok"}
+        )
+        if inert_case:
+            metrics = dict(metrics)
+            metrics["pv_err"] = max(float(metrics["pv_err"]), tol_pv * 2.0)
+            metrics["delay_metric"] = max(float(metrics["delay_metric"]), tol_delay * 2.0)
+            metrics["tau_mis"] = max(float(metrics["tau_mis"]), tol_timescale * 2.0)
+            metrics["pen_species"] = max(float(metrics["pen_species"]), tol_resid * 2.0)
+            metrics["passes"] = False
+            metrics["score"] = -1e6
+            case_reason = f"inert:{status}" if status and status != "ok" else "inert"
+        else:
+            case_reason = ""
+
         ratios = (
             metrics["pv_err"] / tol_vec[0],
             metrics["delay_metric"] / tol_vec[1],
@@ -630,6 +681,8 @@ def evaluate_selection_multi(
                 "delta_T": delta_T,
                 "delta_Y": delta_Y,
                 "delay_red": metrics.get("delay_red", 0.0),
+                "reason": case_reason,
+                "diagnostics": diagnostics,
             }
         )
 
@@ -649,6 +702,7 @@ def evaluate_selection_multi(
                     "ratio_delay": float(ratios[1]),
                     "ratio_timescale": float(ratios[2]),
                     "ratio_resid": float(ratios[3]),
+                    "status": status,
                 }
             )
 
@@ -694,6 +748,7 @@ def evaluate_selection_multi(
 
     fails = [cr["id"] for cr in case_results if not cr["metrics"]["passes"]]
     exceed = [max(0.0, r - 1.0) for r in ratios]
+    inert_flags = [cr for cr in case_results if cr.get("reason")]
     reason = ""
 
     if fitness_mode == "threshold":
@@ -701,6 +756,8 @@ def evaluate_selection_multi(
             reason = "threshold_fail"
             if fails:
                 reason += ":" + ",".join(map(str, fails))
+            if inert_flags:
+                reason += ":inert"
             fitness = -1e6 * (sum(exceed) + (1.0 if fails else 0.0)) - size_pen
         else:
             margin = sum(1.0 - r for r in ratios)
@@ -811,7 +868,10 @@ def run_ga_reduction(
     if (full.temperature[-1] - full.temperature[0]) < 5.0 or (
         np.max(np.abs(full.mass_fractions[-1] - full.mass_fractions[0])) < 1e-6
     ):
-        raise RuntimeError("Reference case looks inert (ΔT or ΔY too small). Check T0/φ/tf.")
+        if mode == "1d":
+            logger.warning("Reference case looks inert (ΔT or ΔY too small); continuing with inert baseline.")
+        else:
+            raise RuntimeError("Reference case looks inert (ΔT or ΔY too small). Check T0/φ/tf.")
 
     genome_len = len(mech.species_names)
 
@@ -928,6 +988,7 @@ def run_ga_reduction(
             tol_timescale=tol_timescale,
             tol_resid=tol_resid,
             target_species=target_species,
+            integrator_mode="ga_fast",
         )
     else:
         eval_fn = lambda sel: evaluate_selection(
@@ -1387,7 +1448,7 @@ def _compute_case_metrics(
     map_full = {s: i for i, s in enumerate(species_full)}
     map_red = {s: i for i, s in enumerate(species_red)}
 
-    Y_red_interp = _interp_to(full_res.time, red_res.time, red_res.mass_fractions)
+    (Y_red_interp,) = align_to(full_res.time, red_res.time, red_res.mass_fractions)
 
     pv_err = pv_error_aligned(
         full_res.mass_fractions,
@@ -1427,13 +1488,21 @@ def _compute_case_metrics(
     tau_spts_red = spts(red_res.time, red_res.mass_fractions)
 
     log_full_pv = np.log10(tau_pv_full + 1e-30)
-    log_red_pv = _interp_to(full_res.time, red_res.time, np.log10(tau_pv_red + 1e-30))
+    (log_red_pv,) = align_to(
+        full_res.time,
+        red_res.time,
+        np.log10(tau_pv_red + 1e-30),
+    )
     log_full_spts = np.log10(tau_spts_full + 1e-30)
-    log_red_spts = _interp_to(full_res.time, red_res.time, np.log10(tau_spts_red + 1e-30))
+    (log_red_spts,) = align_to(
+        full_res.time,
+        red_res.time,
+        np.log10(tau_spts_red + 1e-30),
+    )
 
     tau_mis = _rms_norm(log_full_pv - log_red_pv) + _rms_norm(log_full_spts - log_red_spts)
 
-    mask = full_res.time > delay_full
+    mask = full_res.time >= delay_full
     if x_full is not None:
         x_full_arr = np.asarray(x_full, dtype=float)
         if x_full_arr.size >= 2:
@@ -1454,7 +1523,7 @@ def _compute_case_metrics(
             mask = alt
 
     if isinstance(mask, np.ndarray) and not np.any(mask):
-        mask = full_res.time > delay_full
+        mask = full_res.time >= delay_full
         if isinstance(mask, np.ndarray) and not np.any(mask):
             mask = slice(None)
 
@@ -1643,7 +1712,7 @@ def _full_pipeline_batch(
     mask = full.time > delay_full
     map_full = {s: i for i, s in enumerate(mech.species_names)}
     map_red = {s: i for i, s in enumerate(red_mech.species_names)}
-    red_interp_full = _interp_to(full.time, red.time, red.mass_fractions)
+    (red_interp_full,) = align_to(full.time, red.time, red.mass_fractions)
     with open(os.path.join(out_dir, "residual_species.csv"), "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["species", "mean_res", "max_res"])
@@ -2135,6 +2204,7 @@ def _full_pipeline_pfr(
         nsteps=len(full.time) - 1,
         use_mole=False,
         time_grid=full.time,
+        integrator_mode="reference",
     )
 
     base_metrics = _compute_case_metrics(
@@ -2191,6 +2261,7 @@ def _full_pipeline_pfr(
         tol_resid=tol_resid,
         target_species=target_species,
         details=train_details,
+        integrator_mode="reference",
     )
 
     wp5_cases: list[dict] = []
@@ -2229,7 +2300,16 @@ def _full_pipeline_pfr(
                 tf_total,
                 nsteps=steps_effective,
                 use_mole=False,
+                integrator_mode="reference",
             )
+            delta_T_full = float(full_case.temperature[-1] - full_case.temperature[0])
+            delta_Y_full = float(
+                np.max(np.abs(full_case.mass_fractions[-1] - full_case.mass_fractions[0]))
+            )
+            if delta_T_full < 5.0 and delta_Y_full < 1e-6:
+                logger.warning("Skipping inert robustness case %s (full)", case_id)
+                return
+
 
         red_case = runner(
             red_mech.solution,
@@ -2240,7 +2320,14 @@ def _full_pipeline_pfr(
             nsteps=len(full_case.time) - 1,
             use_mole=False,
             time_grid=full_case.time,
+            integrator_mode="reference",
         )
+        diagnostics = getattr(red_case, "diagnostics", {}) or {}
+        if diagnostics.get("status") not in (None, "ok"):
+            logger.warning("Robustness case %s reduced run marked %s", case_id, diagnostics.get("status"))
+            return
+
+
 
         metrics = _compute_case_metrics(
             full_case,
@@ -2389,41 +2476,42 @@ def _full_pipeline_pfr(
                 )
             profiles_rows.append(row)
 
+    base_profile_fields = ["case_id", "application", "x", "temperature_full", "temperature_red", "ch4_conv_full", "ch4_conv_red", "h2co_full", "h2co_red"]
     with open(os.path.join(out_dir, "pfr_profiles.csv"), "w", newline="") as f:
         if profiles_rows:
             fieldnames = list(profiles_rows[0].keys())
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for row in profiles_rows:
-                writer.writerow(row)
+        else:
+            fieldnames = base_profile_fields
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in profiles_rows:
+            writer.writerow(row)
 
+    kpi_fields = ["case_id", "application", "phi", "T0", "p", "CH4_full", "CH4_red", "CO2_full", "CO2_red", "H2CO_full", "H2CO_red", "ignition_full", "ignition_red", "pv_err", "delay_metric", "tau_mis", "pen_species", "ign_shift", "passes"]
     with open(os.path.join(out_dir, "pfr_kpis.csv"), "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=kpi_rows[0].keys()) if kpi_rows else None
-        if writer:
-            writer.writeheader()
-            for row in kpi_rows:
-                writer.writerow(row)
+        writer = csv.DictWriter(f, fieldnames=kpi_fields)
+        writer.writeheader()
+        for row in kpi_rows:
+            writer.writerow(row)
 
+    summary_fields = ["case_id", "application", "weight", "pv_err", "delay_metric", "tau_mis", "pen_species", "ign_shift", "passes", "ratio_pv", "ratio_delay", "ratio_timescale", "ratio_resid", "status"]
     with open(os.path.join(out_dir, "train_summary.csv"), "w", newline="") as f:
-        if train_details:
-            fieldnames = list(train_details[0].keys())
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for row in train_details:
-                writer.writerow(row)
+        writer = csv.DictWriter(f, fieldnames=summary_fields)
+        writer.writeheader()
+        for row in train_details:
+            writer.writerow(row)
 
-    if robustness_wp5:
-        with open(os.path.join(out_dir, "robustness_1d.csv"), "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=robustness_wp5[0].keys())
-            writer.writeheader()
-            for row in robustness_wp5:
-                writer.writerow(row)
-    if robustness_plasma:
-        with open(os.path.join(out_dir, "robustness_plasma.csv"), "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=robustness_plasma[0].keys())
-            writer.writeheader()
-            for row in robustness_plasma:
-                writer.writerow(row)
+    robust_fields = ["case_id", "application", "pv_err", "delay_metric", "tau_mis", "pen_species", "ign_shift", "score", "passes"]
+    with open(os.path.join(out_dir, "robustness_1d.csv"), "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=robust_fields)
+        writer.writeheader()
+        for row in robustness_wp5:
+            writer.writerow(row)
+    with open(os.path.join(out_dir, "robustness_plasma.csv"), "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=robust_fields)
+        writer.writeheader()
+        for row in robustness_plasma:
+            writer.writerow(row)
 
     df_kpi = pd.DataFrame(kpi_rows)
     df_wp5 = pd.DataFrame(robustness_wp5)
