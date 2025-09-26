@@ -3,6 +3,7 @@
 from .configuration import (
     CaseDefinition,
     GeometryProfile,
+    GeometrySegment,
     HeatLossModel,
     InletStream,
     OperatingEnvelope,
@@ -15,6 +16,7 @@ from .reduction import GAGNNReducer, ReductionConfig
 __all__ = [
     "CaseDefinition",
     "GeometryProfile",
+    "GeometrySegment",
     "HeatLossModel",
     "InletStream",
     "OperatingEnvelope",
