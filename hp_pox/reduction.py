@@ -293,14 +293,27 @@ class GAGNNReducer:
             ct.Species.from_dict(self.mechanism.species(name).input_data)
             for name in active_species
         ]
-        reactions = [
-            ct.Reaction.from_dict(
-                rxn.input_data,
-                species=self.mechanism.species(),
-            )
-            for rxn in self.mechanism.reactions()
-            if set(rxn.reactants).issubset(allowed) and set(rxn.products).issubset(allowed)
-        ]
+        reactions: List[ct.Reaction] = []
+        for rxn in self.mechanism.reactions():
+            if not (
+                set(rxn.reactants).issubset(allowed)
+                and set(rxn.products).issubset(allowed)
+            ):
+                continue
+            rxn_dict = rxn.input_data
+            try:
+                reaction = ct.Reaction.from_dict(
+                    rxn_dict,
+                    species=self.mechanism.species(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.logger.warning(
+                    "Failed to create reaction %s: %s",
+                    getattr(rxn, "equation", "<unknown>"),
+                    exc,
+                )
+                continue
+            reactions.append(reaction)
         return ct.Solution(
             thermo="IdealGas",
             kinetics="GasKinetics",
