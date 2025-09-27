@@ -8,7 +8,6 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Dict, Sequence
 
-import matplotlib.pyplot as plt
 import pandas as pd
 
 from hp_pox import (
@@ -20,6 +19,13 @@ from hp_pox import (
     PlugFlowSolver,
     PlasmaSurrogateConfig,
     load_case_definition,
+)
+from hp_pox.plots import (
+    plot_ignition_positions,
+    plot_kpi_summary,
+    plot_placeholder,
+    plot_profile_overlay,
+    plot_profile_residuals,
 )
 
 
@@ -53,55 +59,89 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ignition-threshold", type=float, default=150.0, help="Threshold for ignition metric.")
     parser.add_argument("--ignition-temperature", type=float, default=1300.0, help="Ignition threshold temperature (K).")
     parser.add_argument(
+        "--include-wall-heat-loss",
+        dest="include_wall_heat_loss",
+        action="store_true",
+        help="Enable wall heat losses in the plug-flow solver.",
+    )
+    parser.add_argument(
+        "--no-wall-heat-loss",
+        dest="include_wall_heat_loss",
+        action="store_false",
+        help="Disable wall heat losses in the plug-flow solver.",
+    )
+    parser.set_defaults(include_wall_heat_loss=None)
+    parser.add_argument(
         "--feed-compat",
         choices=["lump_to_propane", "lump_to_methane", "drop_and_renorm"],
         default="lump_to_propane",
         help="Policy for reconciling feed compositions with the reaction mechanism.",
+    )
+    parser.add_argument(
+        "--compare-mechanisms",
+        nargs=2,
+        metavar=("FULL", "REDUCED"),
+        help="Compare two mechanisms and export overlays.",
+    )
+    parser.add_argument(
+        "--kpi-sweep",
+        action="store_true",
+        help="Run KPI sweeps versus pressure and outlet temperature.",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    case = load_case_definition(args.case)
-    if args.geometry:
-        case.geometry = _load_geometry(args.geometry)
-    if args.heatloss:
-        case.heat_loss = _load_heat_loss(args.heatloss)
-    if args.friction_factor is not None:
-        case = replace(case, friction_factor=args.friction_factor)
-    plasma = None
-    if args.plasma != "none":
-        plasma = _build_plasma_config(args)
-    options = PlugFlowOptions(
-        output_points=args.points,
-        ignition_method=args.ignition_method,
-        ignition_threshold=args.ignition_threshold,
-        ignition_temperature_K=args.ignition_temperature,
-    )
-    solver = PlugFlowSolver(
-        args.mechanism,
-        case,
-        options=options,
-        plasma=plasma,
-        feed_compat_policy=args.feed_compat,
-    )
-    result = solver.solve()
-
     out_dir = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
-    df = result.to_dataframe()
-    df.to_csv(out_dir / f"{case.name}_profiles.csv", index=False)
-    with (out_dir / f"{case.name}_metrics.json").open("w", encoding="utf-8") as handle:
-        json.dump(result.metrics, handle, indent=2)
 
-    _plot_profiles(result, out_dir / f"{case.name}_profiles.png")
+    base_case = load_case_definition(args.case)
+    if args.geometry:
+        base_case.geometry = _load_geometry(args.geometry)
+    if args.heatloss:
+        base_case.heat_loss = _load_heat_loss(args.heatloss)
+    if args.friction_factor is not None:
+        base_case = replace(base_case, friction_factor=args.friction_factor)
+    plasma = _build_plasma_config(args) if args.plasma != "none" else None
+
+    if args.compare_mechanisms:
+        full_mech, reduced_mech = args.compare_mechanisms
+        full_result = _run_simulation(
+            full_mech,
+            base_case,
+            args,
+            plasma=plasma,
+        )
+        reduced_result = _run_simulation(
+            reduced_mech,
+            base_case,
+            args,
+            plasma=plasma,
+        )
+        _export_comparison(
+            full_mech,
+            reduced_mech,
+            full_result,
+            reduced_result,
+            out_dir,
+        )
+    else:
+        result = _run_simulation(
+            args.mechanism,
+            base_case,
+            args,
+            plasma=plasma,
+        )
+        _export_single_result(args.mechanism, result, out_dir)
+
+    if args.kpi_sweep:
+        mech = args.compare_mechanisms[1] if args.compare_mechanisms else args.mechanism
+        _run_kpi_sweep(mech, base_case, args, plasma, out_dir)
 
     if args.plant_data and args.plant_data.exists():
         plant_df = pd.read_csv(args.plant_data)
         plant_df.to_csv(out_dir / "plant_reference.csv", index=False)
-
-    print(f"Simulation for {case.name} complete. Metrics: {result.metrics}")
 
 
 def _load_geometry(path: Path) -> GeometryProfile:
@@ -144,24 +184,167 @@ def _parse_radicals(spec: str) -> Dict[str, float]:
     return radicals
 
 
-def _plot_profiles(result, path: Path) -> None:
-    fig, ax = plt.subplots(1, 2, figsize=(10, 4), dpi=150)
-    ax[0].plot(result.positions_m, result.temperature_K)
-    ax[0].set_xlabel("Axial position (m)")
-    ax[0].set_ylabel("Temperature (K)")
-    ax[0].set_title("Axial temperature")
+def _solver_options(args: argparse.Namespace) -> PlugFlowOptions:
+    include_wall_heat = PlugFlowOptions().include_wall_heat_loss
+    if args.include_wall_heat_loss is not None:
+        include_wall_heat = args.include_wall_heat_loss
+    return PlugFlowOptions(
+        output_points=args.points,
+        ignition_method=args.ignition_method,
+        ignition_threshold=args.ignition_threshold,
+        ignition_temperature_K=args.ignition_temperature,
+        include_wall_heat_loss=include_wall_heat,
+    )
 
+
+def _run_simulation(
+    mechanism: str,
+    case: CaseDefinition,
+    args: argparse.Namespace,
+    plasma: PlasmaSurrogateConfig | None,
+):
+    options = _solver_options(args)
+    solver = PlugFlowSolver(
+        mechanism,
+        case,
+        options=options,
+        plasma=plasma,
+        feed_compat_policy=args.feed_compat,
+    )
+    return solver.solve()
+
+
+def _export_single_result(mechanism: str, result, out_dir: Path) -> None:
+    df = result.to_dataframe()
+    df.to_csv(out_dir / "profiles.csv", index=False)
+    with (out_dir / "metrics.json").open("w", encoding="utf-8") as handle:
+        json.dump(result.metrics, handle, indent=2)
     key_species = [sp for sp in ("CH4", "CO", "H2", "CO2", "H2O") if sp in result.mole_fractions]
-    for name in key_species:
-        ax[1].plot(result.positions_m, result.mole_fractions[name], label=name)
-    ax[1].set_xlabel("Axial position (m)")
-    ax[1].set_ylabel("Mole fraction")
-    ax[1].legend()
-    ax[1].set_title("Species profiles")
+    plot_profile_overlay(
+        result.positions_m,
+        result.temperature_K,
+        result.mole_fractions,
+        temperature_reduced=None,
+        species_reduced=None,
+        species=key_species,
+        out_path=out_dir / "profiles.png",
+        ignition_full=result.metrics.get("ignition_position_m"),
+    )
+    plot_placeholder("Residuals require comparison run", out_dir / "profiles_residual.png")
+    plot_ignition_positions(
+        result.metrics.get("ignition_position_m"),
+        None,
+        out_dir / "ignition_vs_length.png",
+    )
+    plot_placeholder("Ignition delay unavailable", out_dir / "ignition_delay_vs_length.png")
+    plot_placeholder("Run --kpi-sweep to populate", out_dir / "kpis.png")
 
-    fig.tight_layout()
-    fig.savefig(path)
-    plt.close(fig)
+
+def _export_comparison(
+    full_mech: str,
+    reduced_mech: str,
+    full_result,
+    reduced_result,
+    out_dir: Path,
+) -> None:
+    species = [sp for sp in ("CH4", "CO", "H2", "CO2", "H2O") if sp in full_result.mole_fractions]
+    df = pd.DataFrame({"x_m": full_result.positions_m, "T_full": full_result.temperature_K})
+    df["T_reduced"] = reduced_result.temperature_K
+    for specie in species:
+        df[f"X_{specie}_full"] = full_result.mole_fractions.get(specie, 0.0)
+        df[f"X_{specie}_reduced"] = reduced_result.mole_fractions.get(specie, 0.0)
+    df.to_csv(out_dir / "profiles.csv", index=False)
+    metrics_payload = {
+        "full": full_result.metrics,
+        "reduced": reduced_result.metrics,
+        "mechanisms": {"full": full_mech, "reduced": reduced_mech},
+    }
+    with (out_dir / "metrics.json").open("w", encoding="utf-8") as handle:
+        json.dump(metrics_payload, handle, indent=2)
+    plot_profile_overlay(
+        full_result.positions_m,
+        full_result.temperature_K,
+        full_result.mole_fractions,
+        reduced_result.temperature_K,
+        reduced_result.mole_fractions,
+        species,
+        out_dir / "profiles.png",
+        ignition_full=full_result.metrics.get("ignition_position_m"),
+        ignition_reduced=reduced_result.metrics.get("ignition_position_m"),
+    )
+    residuals = {}
+    for specie in species:
+        residuals[specie] = reduced_result.mole_fractions.get(specie, 0.0) - full_result.mole_fractions.get(
+            specie, 0.0
+        )
+    plot_profile_residuals(full_result.positions_m, residuals, out_dir / "profiles_residual.png")
+    plot_ignition_positions(
+        full_result.metrics.get("ignition_position_m"),
+        reduced_result.metrics.get("ignition_position_m"),
+        out_dir / "ignition_vs_length.png",
+    )
+    plot_placeholder("Ignition delay requires transient data", out_dir / "ignition_delay_vs_length.png")
+    plot_placeholder("Run --kpi-sweep to generate KPIs", out_dir / "kpis.png")
+
+
+def _run_kpi_sweep(
+    mechanism: str,
+    case: CaseDefinition,
+    args: argparse.Namespace,
+    plasma: PlasmaSurrogateConfig | None,
+    out_dir: Path,
+) -> None:
+    pressures_bar = [50.0, 60.0, 70.0]
+    temperatures_K = [1473.15, 1673.15]  # 1200 and 1400 C
+    results = []
+    for pressure in pressures_bar:
+        for target_T in temperatures_K:
+            modified_case = replace(case, pressure_bar=pressure, target_temperature_K=target_T)
+            sim_result = _run_simulation(mechanism, modified_case, args, plasma)
+            metrics = _compute_kpis(sim_result)
+            metrics.update({"pressure_bar": pressure, "target_T_K": target_T})
+            results.append(metrics)
+    df = pd.DataFrame(results)
+    df.to_csv(out_dir / "kpis.csv", index=False)
+    if not df.empty:
+        summary_values = {
+            "HC conversion": list(df["hc_conversion"]),
+            "Cold gas efficiency": list(df["cold_gas_efficiency"]),
+            "(CO+H2)/NG LHV": list(df["lhv_ratio"]),
+        }
+        plot_kpi_summary(range(len(df)), summary_values, out_dir / "kpis.png", "Sweep index")
+        for sweep, label in [("pressure_bar", "Pressure (bar)"), ("target_T_K", "Outlet temperature (K)")]:
+            grouped = df.groupby(sweep)
+            positions = list(grouped.groups.keys())
+            values = {
+                "HC conversion": [group["hc_conversion"].mean() for _, group in grouped],
+                "Cold gas efficiency": [group["cold_gas_efficiency"].mean() for _, group in grouped],
+                "(CO+H2)/NG LHV": [group["lhv_ratio"].mean() for _, group in grouped],
+            }
+            plot_kpi_summary(positions, values, out_dir / f"kpis_{sweep}.png", label)
+    else:
+        plot_placeholder("KPI sweep produced no data", out_dir / "kpis.png")
+
+
+def _compute_kpis(result) -> Dict[str, float]:
+    species = result.molar_flows
+    outlet = {name: values[-1] for name, values in species.items()}
+    inlet = {name: values[0] for name, values in species.items()}
+    hc_in = inlet.get("CH4", 0.0)
+    hc_out = outlet.get("CH4", 0.0)
+    conversion = 0.0
+    if hc_in > 0:
+        conversion = 1.0 - hc_out / hc_in
+    lhv = {"CH4": 802.3e3, "H2": 241.8e3, "CO": 283.0e3}
+    fuel_in = sum(inlet.get(sp, 0.0) * lhv.get(sp, 0.0) for sp in lhv)
+    syngas_out = sum(outlet.get(sp, 0.0) * lhv.get(sp, 0.0) for sp in ("CO", "H2"))
+    cold_gas_eff = syngas_out / fuel_in if fuel_in > 0 else 0.0
+    lhv_ratio = syngas_out / fuel_in if fuel_in > 0 else 0.0
+    return {
+        "hc_conversion": conversion,
+        "cold_gas_efficiency": cold_gas_eff,
+        "lhv_ratio": lhv_ratio,
+    }
 
 
 if __name__ == "__main__":
