@@ -300,12 +300,8 @@ class GAGNNReducer:
                 and set(rxn.products).issubset(allowed)
             ):
                 continue
-            rxn_dict = rxn.input_data
             try:
-                reaction = ct.Reaction.from_dict(
-                    rxn_dict,
-                    species=self.mechanism.species(),
-                )
+                reactions.append(rxn)
             except Exception as exc:  # noqa: BLE001
                 self.logger.warning(
                     "Failed to create reaction %s: %s",
@@ -313,7 +309,6 @@ class GAGNNReducer:
                     exc,
                 )
                 continue
-            reactions.append(reaction)
         return ct.Solution(
             thermo="IdealGas",
             kinetics="GasKinetics",
