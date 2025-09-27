@@ -52,6 +52,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ignition-method", choices=["dTdx", "temperature"], default="dTdx")
     parser.add_argument("--ignition-threshold", type=float, default=150.0, help="Threshold for ignition metric.")
     parser.add_argument("--ignition-temperature", type=float, default=1300.0, help="Ignition threshold temperature (K).")
+    parser.add_argument(
+        "--feed-compat",
+        choices=["lump_to_propane", "lump_to_methane", "drop_and_renorm"],
+        default="lump_to_propane",
+        help="Policy for reconciling feed compositions with the reaction mechanism.",
+    )
     return parser.parse_args()
 
 
@@ -73,7 +79,13 @@ def main() -> None:
         ignition_threshold=args.ignition_threshold,
         ignition_temperature_K=args.ignition_temperature,
     )
-    solver = PlugFlowSolver(args.mechanism, case, options=options, plasma=plasma)
+    solver = PlugFlowSolver(
+        args.mechanism,
+        case,
+        options=options,
+        plasma=plasma,
+        feed_compat_policy=args.feed_compat,
+    )
     result = solver.solve()
 
     out_dir = args.out

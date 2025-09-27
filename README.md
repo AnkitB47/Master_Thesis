@@ -10,6 +10,12 @@ Our fully functional **Prototype v1** performs end-to-end reduction, evaluates t
 
 ---
 
+## ♨️ HP-POX feed compatibility
+
+The HP-POX benchmark feeds include trace quantities of heavier hydrocarbons such as the butane isomers (`IC4H10`, `NC4H10`). Because widely used reference mechanisms like **GRI-30** omit these species, the 1-D plug-flow solver automatically reconciles feeds with the selected mechanism. Missing C4+ components are lumped into propane (`C3H8`) by default—falling back to methane if propane is unavailable—so that carbon accounting remains defensible when switching between mechanisms.
+
+---
+
 ## 🚀 How to Run the Pipeline
 
 ```bash
