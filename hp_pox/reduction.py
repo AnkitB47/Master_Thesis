@@ -294,7 +294,10 @@ class GAGNNReducer:
             for name in active_species
         ]
         reactions = [
-            ct.Reaction.from_dict(rxn.input_data)
+            ct.Reaction.from_dict(
+                rxn.input_data,
+                species=self.mechanism.species(),
+            )
             for rxn in self.mechanism.reactions()
             if set(rxn.reactants).issubset(allowed) and set(rxn.products).issubset(allowed)
         ]
