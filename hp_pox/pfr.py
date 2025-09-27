@@ -99,6 +99,12 @@ class PlugFlowSolver:
             self._element_matrix = np.zeros((0, self.gas.n_species))
         self._initial_element_totals: np.ndarray | None = None
         self._validate_stream_species()
+        self._diagnostics: Dict[str, object] = {
+            "max_abs_omega": 0.0,
+            "reaction_term": [],
+            "wall_term": [],
+            "plasma_term": [],
+        }
 
     # ------------------------------------------------------------------
     # Public API
@@ -157,6 +163,7 @@ class PlugFlowSolver:
         total_mass_flow = 0.0
         total_enthalpy_flow = 0.0
         total_molar_flow = np.zeros(gas.n_species)
+        species_names = gas.species_names
         reconciliation_logs: list[str] = []
         for stream in self.case.streams:
             cleaned_composition, mapping = reconcile_feed_with_mechanism(
@@ -189,6 +196,30 @@ class PlugFlowSolver:
         y0 = np.concatenate(([temperature], total_molar_flow, [pressure]))
         if self._element_matrix.size:
             self._initial_element_totals = self._element_matrix @ total_molar_flow
+            inventory = {
+                elem: float(self._initial_element_totals[i]) for i, elem in enumerate(self._tracked_elements)
+            }
+            self.logger.debug("Inlet element inventory (kmol): %s", inventory)
+        composition_preview = {
+            species_names[i]: float(value)
+            for i, value in enumerate(composition)
+            if value > 1e-6
+        }
+        self.logger.debug(
+            "Inlet mixture: T=%.2f K, P=%.2f Pa, X=%s",
+            temperature,
+            pressure,
+            {k: round(v, 6) for k, v in list(composition_preview.items())[:8]},
+        )
+        self.logger.debug(
+            "Initial molar flow (kmol/s): %s",
+            {
+                species_names[i]: float(total_molar_flow[i])
+                for i in range(len(species_names))
+                if total_molar_flow[i] > 0
+            },
+        )
+        self.logger.debug("Initial mass flow: %.6e kg/s", total_mass_flow)
         initial = {
             "molar_flow": total_molar_flow,
             "mass_flow": total_mass_flow,
@@ -239,10 +270,14 @@ class PlugFlowSolver:
 
         if self._element_matrix.size:
             current_elements = self._element_matrix @ molar_flow_raw
-            drift = float(np.max(np.abs(current_elements - self._initial_element_totals)))
+            residual = current_elements - self._initial_element_totals
+            drift = float(np.max(np.abs(residual)))
             if drift > 1e-8:
+                details = {
+                    elem: float(residual[i]) for i, elem in enumerate(self._tracked_elements)
+                }
                 raise ValueError(
-                    f"Elemental imbalance detected at x={x:.4f} m (max drift={drift:.3e})"
+                    f"Elemental imbalance detected at x={x:.4f} m (max drift={drift:.3e}): {details}"
                 )
 
         cp_flow = float(np.dot(cp, molar_flow))
@@ -267,12 +302,24 @@ class PlugFlowSolver:
         if cp_mass <= 0.0:
             raise ValueError("Non-positive heat capacity encountered")
 
-        reaction_term = float(np.dot(omega, h))
-        extra_heat = plasma_source.heat_W_per_m
-        reaction_source = -reaction_term / (rho * cp_mass)
-        conductive_sink = -q_loss / (mass_flow * cp_mass) if mass_flow > 0 else 0.0
-        plasma_source_term = extra_heat / (mass_flow * cp_mass) if mass_flow > 0 else 0.0
-        dTdx = reaction_source / velocity + conductive_sink + plasma_source_term
+        reaction_term = float(np.dot(omega, h))  # J/m^3/s
+        extra_heat = plasma_source.heat_W_per_m  # W/m
+        reaction_source = 0.0
+        wall_source = 0.0
+        plasma_source_term = 0.0
+        if rho * cp_mass <= 0:
+            raise ValueError("Non-positive density*cp term encountered")
+        reaction_source = -(reaction_term) / (rho * cp_mass)
+        if mass_flow > 0:
+            wall_source = -q_loss / (mass_flow * cp_mass)
+            plasma_source_term = extra_heat / (mass_flow * cp_mass)
+        dTdx = (reaction_source + wall_source + plasma_source_term) / velocity
+        self._diagnostics["reaction_term"].append(reaction_source)
+        self._diagnostics["wall_term"].append(wall_source)
+        self._diagnostics["plasma_term"].append(plasma_source_term)
+        self._diagnostics["max_abs_omega"] = max(
+            float(self._diagnostics["max_abs_omega"]), float(np.max(np.abs(omega)))
+        )
 
         friction = self.case.friction_factor
         dPdx = 0.0
@@ -317,6 +364,7 @@ class PlugFlowSolver:
             molar_flow_profile,
             initial_state,
         )
+        self._log_diagnostics()
         metadata = {
             "case": self.case.name,
             "options": self.options,
@@ -374,15 +422,19 @@ class PlugFlowSolver:
 
         metrics["pressure_drop_Pa"] = float(pressures[0] - pressures[-1])
 
+        ignition_position = None
         if options.ignition_method == "dTdx":
-            gradients = np.gradient(temperatures, xs)
-            idx = np.argmax(np.abs(gradients))
-            if abs(gradients[idx]) >= options.ignition_threshold:
-                metrics["ignition_position_m"] = float(xs[idx])
+            ignition_position = _detect_ignition_by_gradient(
+                xs,
+                temperatures,
+                threshold=options.ignition_threshold,
+            )
         elif options.ignition_method == "temperature":
-            above = np.where(temperatures >= options.ignition_temperature_K)[0]
-            if above.size:
-                metrics["ignition_position_m"] = float(xs[above[0]])
+            ignition_position = _detect_ignition_by_temperature(
+                xs, temperatures, options.ignition_temperature_K
+            )
+        if ignition_position is not None:
+            metrics["ignition_position_m"] = ignition_position
 
         return metrics
 
@@ -398,6 +450,59 @@ class PlugFlowSolver:
                 raise ValueError(
                     f"Stream '{stream.name}' cannot be reconciled with mechanism {self.gas.name}: {exc}"
                 ) from exc
+
+    def _log_diagnostics(self) -> None:
+        if not self._diagnostics:
+            return
+        self.logger.debug(
+            "Max |omega| observed: %.3e kmol/m^3/s",
+            float(self._diagnostics.get("max_abs_omega", 0.0)),
+        )
+        for key in ("reaction_term", "wall_term", "plasma_term"):
+            series = self._diagnostics.get(key, [])
+            if not series:
+                continue
+            array = np.asarray(series, dtype=float)
+            self.logger.debug(
+                "dT/dx contribution %s: mean=%.3e, min=%.3e, max=%.3e",
+                key,
+                float(np.mean(array)),
+                float(np.min(array)),
+                float(np.max(array)),
+            )
+        self._diagnostics = {
+            "max_abs_omega": 0.0,
+            "reaction_term": [],
+            "wall_term": [],
+            "plasma_term": [],
+        }
+
+
+def _detect_ignition_by_temperature(xs: np.ndarray, temperatures: np.ndarray, threshold: float) -> float | None:
+    above = np.where(temperatures >= threshold)[0]
+    if above.size:
+        return float(xs[above[0]])
+    return None
+
+
+def _detect_ignition_by_gradient(
+    xs: np.ndarray,
+    temperatures: np.ndarray,
+    threshold: float,
+) -> float | None:
+    gradients = np.gradient(temperatures, xs)
+    candidates = np.where(np.abs(gradients) >= threshold)[0]
+    if not candidates.size:
+        return None
+    second = np.gradient(gradients, xs)
+    for idx in candidates:
+        left = second[idx - 1] if idx > 0 else second[idx]
+        right = second[idx + 1] if idx + 1 < second.size else second[idx]
+        if np.sign(left) == 0 or np.sign(right) == 0:
+            return float(xs[idx])
+        if np.sign(left) != np.sign(right):
+            return float(xs[idx])
+    return float(xs[candidates[0]])
 
 
 def _stream_properties(
