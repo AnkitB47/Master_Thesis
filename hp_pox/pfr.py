@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Sequence
 import copy
+import logging
 import cantera as ct
 import numpy as np
 from scipy.integrate import solve_ivp
@@ -77,6 +78,26 @@ class PlugFlowSolver:
         self.options = options or PlugFlowOptions()
         self.plasma = plasma
         self.feed_compat_policy = feed_compat_policy
+        self.logger = logging.getLogger(__name__)
+        tracked = []
+        for symbol in ("C", "H", "O", "N"):
+            try:
+                self.gas.element_index(symbol)
+            except ValueError:
+                continue
+            tracked.append(symbol)
+        self._tracked_elements = tracked
+        if tracked:
+            self._element_matrix = np.array(
+                [
+                    [self.gas.n_atoms(species, elem) for species in self.gas.species_names]
+                    for elem in tracked
+                ],
+                dtype=float,
+            )
+        else:
+            self._element_matrix = np.zeros((0, self.gas.n_species))
+        self._initial_element_totals: np.ndarray | None = None
         self._validate_stream_species()
 
     # ------------------------------------------------------------------
@@ -87,7 +108,24 @@ class PlugFlowSolver:
         y0, initial_state = self._initial_state()
 
         method = self.options.method
-        max_step = self.options.max_step or length / (self.options.output_points * 12)
+        max_step = self.options.max_step
+        if max_step is None:
+            max_step = length / (self.options.output_points * 12)
+        first_step = max(length / (self.options.output_points * 10), 1e-9)
+
+        def temperature_event(x, y):
+            return 4000.0 - y[0]
+
+        temperature_event.terminal = True
+        temperature_event.direction = -1
+
+        def extinction_event(x, y):
+            total = float(np.sum(np.maximum(y[1 : 1 + self.gas.n_species], 0.0)))
+            return total
+
+        extinction_event.terminal = True
+        extinction_event.direction = -1
+
         solution = solve_ivp(
             fun=lambda x, y: self._rhs(x, y),
             t_span=(0.0, length),
@@ -97,6 +135,8 @@ class PlugFlowSolver:
             rtol=self.options.rtol,
             dense_output=True,
             max_step=max_step,
+            first_step=first_step,
+            events=[temperature_event, extinction_event],
         )
         if not solution.success:
             raise RuntimeError(f"Integration failed: {solution.message}")
@@ -117,12 +157,17 @@ class PlugFlowSolver:
         total_mass_flow = 0.0
         total_enthalpy_flow = 0.0
         total_molar_flow = np.zeros(gas.n_species)
+        reconciliation_logs: list[str] = []
         for stream in self.case.streams:
-            cleaned_composition = reconcile_feed_with_mechanism(
+            cleaned_composition, mapping = reconcile_feed_with_mechanism(
                 gas,
                 stream.composition,
                 policy=self.feed_compat_policy,
+                return_mapping=True,
             )
+            if mapping:
+                formatted = ", ".join(f"{missing}->{sink}" for missing, sink in mapping.items())
+                reconciliation_logs.append(f"{stream.name}: {formatted}")
             reconciled_stream = replace(stream, composition=cleaned_composition)
             stream_flow, stream_enthalpy, molar_flow = _stream_properties(
                 reconciled_stream, gas, pressure
@@ -130,6 +175,8 @@ class PlugFlowSolver:
             total_mass_flow += stream_flow
             total_enthalpy_flow += stream_enthalpy
             total_molar_flow += molar_flow
+        if reconciliation_logs:
+            self.logger.info("Feed reconciliation applied: %s", "; ".join(reconciliation_logs))
         if total_mass_flow <= 0:
             raise ValueError("Total mass flow rate must be positive")
         mixture_enthalpy = total_enthalpy_flow / total_mass_flow
@@ -140,6 +187,8 @@ class PlugFlowSolver:
         gas.HPX = mixture_enthalpy, pressure, composition
         temperature = gas.T
         y0 = np.concatenate(([temperature], total_molar_flow, [pressure]))
+        if self._element_matrix.size:
+            self._initial_element_totals = self._element_matrix @ total_molar_flow
         initial = {
             "molar_flow": total_molar_flow,
             "mass_flow": total_mass_flow,
@@ -188,6 +237,14 @@ class PlugFlowSolver:
                 injection[idx] += value
             dFdx += injection
 
+        if self._element_matrix.size:
+            current_elements = self._element_matrix @ molar_flow_raw
+            drift = float(np.max(np.abs(current_elements - self._initial_element_totals)))
+            if drift > 1e-8:
+                raise ValueError(
+                    f"Elemental imbalance detected at x={x:.4f} m (max drift={drift:.3e})"
+                )
+
         cp_flow = float(np.dot(cp, molar_flow))
         if cp_flow == 0.0:
             raise ValueError("Zero heat capacity flow encountered")
@@ -200,18 +257,27 @@ class PlugFlowSolver:
             if u_value is not None and tw is not None:
                 q_loss = perimeter * u_value * (temperature - tw)
 
-        reaction_term = float(np.dot(omega, h))
-        extra_heat = plasma_source.heat_W_per_m
-        dTdx = (-area * reaction_term - q_loss + extra_heat) / cp_flow
-
         molecular_weights = gas.molecular_weights  # kg/kmol
         mass_flow = float(np.dot(molar_flow, molecular_weights))
         rho = gas.density
         velocity = mass_flow / (rho * area)
+        cp_mass = gas.cp_mass
+        if velocity <= 0.0:
+            raise ValueError("Non-positive axial velocity encountered")
+        if cp_mass <= 0.0:
+            raise ValueError("Non-positive heat capacity encountered")
+
+        reaction_term = float(np.dot(omega, h))
+        extra_heat = plasma_source.heat_W_per_m
+        reaction_source = -reaction_term / (rho * cp_mass)
+        conductive_sink = -q_loss / (mass_flow * cp_mass) if mass_flow > 0 else 0.0
+        plasma_source_term = extra_heat / (mass_flow * cp_mass) if mass_flow > 0 else 0.0
+        dTdx = reaction_source / velocity + conductive_sink + plasma_source_term
+
         friction = self.case.friction_factor
         dPdx = 0.0
         if friction > 0:
-            dPdx = -2.0 * friction * rho * velocity * velocity / hydraulic_diameter
+            dPdx = -friction * rho * velocity * velocity / (2.0 * hydraulic_diameter)
 
         return np.concatenate(([dTdx], dFdx, [dPdx]))
 
