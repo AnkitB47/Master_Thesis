@@ -58,8 +58,31 @@ def reconcile_feed_with_mechanism(
     gas: ct.Solution,
     composition: Mapping[str, float],
     policy: str = "lump_to_propane",
-) -> Dict[str, float]:
-    """Return a mechanism-compatible composition mapping."""
+    *,
+    return_mapping: bool = False,
+) -> Dict[str, float] | tuple[Dict[str, float], Dict[str, str]]:
+    """Return a mechanism-compatible composition mapping.
+
+    Parameters
+    ----------
+    gas:
+        Cantera ``Solution`` object representing the mechanism.
+    composition:
+        Original feed composition mapping.
+    policy:
+        Strategy for reconciling species that are missing from the mechanism.
+    return_mapping:
+        When ``True`` the function also returns a mapping describing how
+        missing species were lumped into available surrogate species.  The
+        mapping keys are the missing species and the values are the surrogate
+        species selected for them.
+
+    Returns
+    -------
+    Dict[str, float] or tuple
+        A mechanism-compatible composition.  When ``return_mapping`` is set,
+        a tuple of ``(composition, mapping)`` is returned.
+    """
 
     if policy not in _POLICIES:
         raise ValueError(f"Unknown feed compatibility policy: {policy}")
@@ -68,6 +91,7 @@ def reconcile_feed_with_mechanism(
     cleaned: Dict[str, float] = {}
     missing_heavy = 0.0
     missing_other = 0.0
+    reconciliation: Dict[str, str] = {}
 
     for name, value in composition.items():
         frac = float(value)
@@ -86,14 +110,27 @@ def reconcile_feed_with_mechanism(
         if missing_heavy > 0.0:
             sink = _select_propane_sink(mechanism_species)
             cleaned[sink] = cleaned.get(sink, 0.0) + missing_heavy
+            for name, value in composition.items():
+                if value > 0 and name not in mechanism_species:
+                    carbon = _estimate_carbon_count(name)
+                    if carbon is not None and carbon >= _HEAVY_C_THRESHOLD:
+                        reconciliation[name] = sink
         if missing_other > 0.0:
             sink = _select_methane_sink(mechanism_species)
             cleaned[sink] = cleaned.get(sink, 0.0) + missing_other
+            for name, value in composition.items():
+                if value > 0 and name not in mechanism_species:
+                    carbon = _estimate_carbon_count(name)
+                    if carbon is None or carbon < _HEAVY_C_THRESHOLD:
+                        reconciliation[name] = sink
     elif policy == "lump_to_methane":
         total_missing = missing_heavy + missing_other
         if total_missing > 0.0:
             sink = _select_methane_sink(mechanism_species)
             cleaned[sink] = cleaned.get(sink, 0.0) + total_missing
+            for name, value in composition.items():
+                if value > 0 and name not in mechanism_species:
+                    reconciliation[name] = sink
     elif policy == "drop_and_renorm":
         pass
 
@@ -105,7 +142,11 @@ def reconcile_feed_with_mechanism(
             f"dropped fraction={missing_total:.6f}."
         )
 
-    return {name: value / total for name, value in cleaned.items()}
+    reconciled = {name: value / total for name, value in cleaned.items()}
+
+    if not return_mapping:
+        return reconciled
+    return reconciled, reconciliation
 
 
 # ---------------------------------------------------------------------------

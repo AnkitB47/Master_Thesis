@@ -41,8 +41,8 @@ def apply_plasma_surrogates(
     if config is None or not config.is_active(position):
         return PlasmaSource()
     if config.mode == "thermal":
-        length = (config.end_position_m or config.start_position_m) - config.start_position_m
-        length = max(length, 1e-6)
+        end = config.end_position_m if config.end_position_m is not None else config.start_position_m
+        length = max(end - config.start_position_m, 1e-6)
         heat_per_m = config.plasma_power_W / length
         if config.exit_temperature_K is not None:
             cp_mass = gas.cp_mass
@@ -67,5 +67,72 @@ def apply_plasma_surrogates(
         width = max(config.injection_width_m, 1e-6)
         for key in species_injection:
             species_injection[key] /= width
-        return PlasmaSource(species_kmol_per_m=species_injection)
+        balanced = _enforce_element_conservation(species_injection, gas)
+        return PlasmaSource(species_kmol_per_m=balanced)
     return PlasmaSource()
+
+
+def _enforce_element_conservation(
+    injection: Mapping[str, float], gas: ct.Solution
+) -> Dict[str, float]:
+    """Return a species source profile that conserves C/H/O/N elements."""
+
+    adjusted: Dict[str, float] = dict(injection)
+    if not injection:
+        return adjusted
+
+    element_balance = {elem: 0.0 for elem in ("C", "H", "O", "N") if elem in gas.element_names}
+    if not element_balance:
+        return adjusted
+
+    for species, rate in injection.items():
+        try:
+            gas.species_index(species)
+        except ValueError as exc:
+            raise ValueError(f"Plasma injection species '{species}' missing from mechanism") from exc
+        for elem in element_balance:
+            element_balance[elem] += rate * gas.n_atoms(species, elem)
+
+    def apply_removal(target_species: str, atoms: Dict[str, float], rate: float) -> None:
+        if target_species not in gas.species_names:
+            raise ValueError(
+                f"Cannot conserve elements: species '{target_species}' missing from mechanism"
+            )
+        adjusted[target_species] = adjusted.get(target_species, 0.0) - rate
+        for elem, count in atoms.items():
+            if elem in element_balance:
+                element_balance[elem] -= rate * count
+
+    if "C" in element_balance and element_balance["C"] > 0:
+        if "CH4" not in gas.species_names:
+            raise ValueError("CH4 required to balance carbon for radical injection")
+        atoms = {elem: gas.n_atoms("CH4", elem) for elem in element_balance}
+        removal = element_balance["C"] / max(atoms.get("C", 0.0), 1e-12)
+        apply_removal("CH4", atoms, removal)
+
+    if "O" in element_balance and element_balance["O"] > 1e-12:
+        if "O2" not in gas.species_names:
+            raise ValueError("O2 required to balance oxygen for radical injection")
+        atoms = {elem: gas.n_atoms("O2", elem) for elem in element_balance}
+        removal = element_balance["O"] / max(atoms.get("O", 0.0), 1e-12)
+        apply_removal("O2", atoms, removal)
+
+    if "H" in element_balance and element_balance["H"] > 1e-12:
+        target = "H2" if "H2" in gas.species_names else None
+        if target is None:
+            raise ValueError("H2 required to balance hydrogen for radical injection")
+        atoms = {elem: gas.n_atoms(target, elem) for elem in element_balance}
+        removal = element_balance["H"] / max(atoms.get("H", 0.0), 1e-12)
+        apply_removal(target, atoms, removal)
+
+    if "N" in element_balance and element_balance["N"] > 1e-12:
+        if "N2" not in gas.species_names:
+            raise ValueError("N2 required to balance nitrogen for radical injection")
+        atoms = {elem: gas.n_atoms("N2", elem) for elem in element_balance}
+        removal = element_balance["N"] / max(atoms.get("N", 0.0), 1e-12)
+        apply_removal("N2", atoms, removal)
+
+    residual = max(abs(value) for value in element_balance.values()) if element_balance else 0.0
+    if residual > 1e-8:
+        raise ValueError(f"Failed to conserve elements during radical injection (residual={residual:.2e})")
+    return adjusted
