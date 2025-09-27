@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Sequence
-
+import copy
 import cantera as ct
 import numpy as np
 from scipy.integrate import solve_ivp
@@ -87,7 +87,7 @@ class PlugFlowSolver:
         y0, initial_state = self._initial_state()
 
         method = self.options.method
-        max_step = self.options.max_step or length / (self.options.output_points * 4)
+        max_step = self.options.max_step or length / (self.options.output_points * 12)
         solution = solve_ivp(
             fun=lambda x, y: self._rhs(x, y),
             t_span=(0.0, length),
@@ -108,7 +108,11 @@ class PlugFlowSolver:
     # Internal helpers
     # ------------------------------------------------------------------
     def _initial_state(self) -> tuple[np.ndarray, Dict[str, np.ndarray]]:
-        gas = self.gas.clone()
+        try:
+            gas = ct.Solution(self.gas.source)
+            gas.TPX = self.gas.T, self.gas.P, self.gas.X
+        except Exception:
+            gas = copy.deepcopy(self.gas)
         pressure = self.case.pressure_Pa
         total_mass_flow = 0.0
         total_enthalpy_flow = 0.0
@@ -148,14 +152,21 @@ class PlugFlowSolver:
     def _rhs(self, x: float, y: np.ndarray) -> np.ndarray:
         gas = self.gas
         nsp = gas.n_species
-        temperature = y[0]
-        molar_flow = y[1 : 1 + nsp]
-        pressure = y[-1]
-        total_kmol = molar_flow.sum()
-        if total_kmol <= 0:
-            raise ValueError("Total molar flow went non-positive during integration")
-        composition = np.clip(molar_flow / total_kmol, 1e-32, None)
+        temperature = float(y[0])
+        molar_flow_raw = y[1 : 1 + nsp]
+        pressure = float(y[-1])
+
+        # use a tiny floor only for building composition (do NOT mutate the ODE state)
+        molar_flow_pos = np.maximum(molar_flow_raw, 1e-40)
+        total_kmol = float(molar_flow_pos.sum())
+        if not np.isfinite(total_kmol) or total_kmol <= 1e-40:
+            # bail out gracefully (let integrator backtrack)
+            return np.concatenate(([0.0], np.zeros(nsp), [0.0]))
+
+        composition = np.clip(molar_flow_pos / total_kmol, 1e-32, 1.0)
         gas.TPX = temperature, pressure, composition
+        molar_flow = molar_flow_raw  # keep original for derivatives
+
         area = self.case.geometry.area_at(x)
         perimeter = self.case.geometry.perimeter_at(x)
         hydraulic_diameter = self.case.geometry.hydraulic_diameter_at(x)
@@ -326,7 +337,11 @@ class PlugFlowSolver:
 def _stream_properties(
     stream: InletStream, gas: ct.Solution, pressure: float
 ) -> tuple[float, float, np.ndarray]:
-    stream_gas = gas.clone()
+    try:
+        # Reload the mechanism with same thermo/kinetics
+        stream_gas = ct.Solution(gas.source)
+    except Exception:
+        stream_gas = copy.deepcopy(gas)
     composition = np.array([stream.composition.get(name, 0.0) for name in stream_gas.species_names])
     if stream.basis.lower() == "mole":
         total = composition.sum()
