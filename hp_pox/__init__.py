@@ -12,6 +12,7 @@ from .configuration import (
 from .pfr import PlugFlowOptions, PlugFlowResult, PlugFlowSolver
 from .plasma import PlasmaSurrogateConfig
 from .reduction import GAGNNReducer, ReductionConfig
+from .compat import reconcile_feed_with_mechanism
 
 __all__ = [
     "CaseDefinition",
@@ -27,4 +28,5 @@ __all__ = [
     "PlasmaSurrogateConfig",
     "GAGNNReducer",
     "ReductionConfig",
+    "reconcile_feed_with_mechanism",
 ]

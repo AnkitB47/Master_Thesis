@@ -33,6 +33,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end", type=float, default=0.35, help="Injection end location (m)")
     parser.add_argument("--out", type=Path, default=Path("results/plasma"))
     parser.add_argument("--points", type=int, default=220)
+    parser.add_argument(
+        "--feed-compat",
+        choices=["lump_to_propane", "lump_to_methane", "drop_and_renorm"],
+        default="lump_to_propane",
+        help="Policy for reconciling inlet streams with the mechanism.",
+    )
     return parser.parse_args()
 
 
@@ -52,7 +58,13 @@ def main() -> None:
                 start_position_m=args.start,
                 end_position_m=args.end,
             )
-            solver = PlugFlowSolver(args.mechanism, case, PlugFlowOptions(output_points=args.points), plasma=plasma)
+            solver = PlugFlowSolver(
+                args.mechanism,
+                case,
+                PlugFlowOptions(output_points=args.points),
+                plasma=plasma,
+                feed_compat_policy=args.feed_compat,
+            )
             result = solver.solve()
             records.append({"plasma_power_W": power} | result.metrics)
         df = pd.DataFrame(records)
@@ -69,7 +81,13 @@ def main() -> None:
                 end_position_m=args.end,
                 injection_width_m=max(args.end - args.start, 1e-3),
             )
-            solver = PlugFlowSolver(args.mechanism, case, PlugFlowOptions(output_points=args.points), plasma=plasma)
+            solver = PlugFlowSolver(
+                args.mechanism,
+                case,
+                PlugFlowOptions(output_points=args.points),
+                plasma=plasma,
+                feed_compat_policy=args.feed_compat,
+            )
             result = solver.solve()
             records.append({"radical_flow_kmol_s": flow} | result.metrics)
         df = pd.DataFrame(records)

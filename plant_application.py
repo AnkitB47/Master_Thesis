@@ -25,6 +25,7 @@ from hp_pox import (
     load_case_definition,
     load_plant_definition,
 )
+from hp_pox.compat import reconcile_feed_with_mechanism
 from hp_pox.pfr import _stream_properties
 
 
@@ -39,6 +40,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out", type=Path, default=Path("results/plant"))
     parser.add_argument("--plant-data", type=Path, help="Optional CSV with measured plant KPIs for calibration")
     parser.add_argument("--fit-U", action="store_true", help="Fit an effective U(x) profile to plant data")
+    parser.add_argument(
+        "--feed-compat",
+        choices=["lump_to_propane", "lump_to_methane", "drop_and_renorm"],
+        default="lump_to_propane",
+        help="Policy for reconciling stream compositions with the selected mechanism.",
+    )
     return parser.parse_args()
 
 
@@ -57,13 +64,18 @@ def main() -> None:
         plant_envelope = plant.operating_envelope
 
     gas = ct.Solution(args.mechanism)
-    base_ratios = _compute_base_ratios(base_case, gas)
+    base_ratios = _compute_base_ratios(base_case, gas, args.feed_compat)
 
     samples = _generate_samples(plant_envelope.entries, args.samples)
     results: List[Dict[str, float]] = []
     for sample in samples:
         case_variant = _apply_sample(base_case, sample, base_ratios)
-        solver = PlugFlowSolver(args.mechanism, case_variant, PlugFlowOptions(output_points=160))
+        solver = PlugFlowSolver(
+            args.mechanism,
+            case_variant,
+            PlugFlowOptions(output_points=160),
+            feed_compat_policy=args.feed_compat,
+        )
         result = solver.solve()
         record = {
             "pressure_bar": case_variant.pressure_bar,
@@ -116,12 +128,14 @@ def _apply_sample(case: CaseDefinition, sample: Dict[str, float], base_ratios: D
     return updated
 
 
-def _compute_base_ratios(case: CaseDefinition, gas: ct.Solution) -> Dict[str, float]:
+def _compute_base_ratios(case: CaseDefinition, gas: ct.Solution, policy: str) -> Dict[str, float]:
     oxygen_flow = 0.0
     steam_flow = 0.0
     carbon_flow = 0.0
     for stream in case.streams:
-        mass_flow, _, molar_flow = _stream_properties(stream, gas, case.pressure_Pa)
+        cleaned = reconcile_feed_with_mechanism(gas, stream.composition, policy=policy)
+        reconciled_stream = replace(stream, composition=cleaned)
+        mass_flow, _, molar_flow = _stream_properties(reconciled_stream, gas, case.pressure_Pa)
         species_names = gas.species_names
         for idx, name in enumerate(species_names):
             atoms_c = gas.n_atoms(name, "C")

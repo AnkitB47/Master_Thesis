@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, Iterable, Mapping, Sequence
 
@@ -10,6 +10,7 @@ import cantera as ct
 import numpy as np
 from scipy.integrate import solve_ivp
 
+from .compat import reconcile_feed_with_mechanism
 from .configuration import CaseDefinition, GeometryProfile, HeatLossModel, InletStream
 from .plasma import PlasmaSource, PlasmaSurrogateConfig, apply_plasma_surrogates
 
@@ -66,6 +67,7 @@ class PlugFlowSolver:
         case: CaseDefinition,
         options: PlugFlowOptions | None = None,
         plasma: PlasmaSurrogateConfig | None = None,
+        feed_compat_policy: str = "lump_to_propane",
     ) -> None:
         if isinstance(mechanism, ct.Solution):
             self.gas = mechanism
@@ -74,6 +76,7 @@ class PlugFlowSolver:
         self.case = case
         self.options = options or PlugFlowOptions()
         self.plasma = plasma
+        self.feed_compat_policy = feed_compat_policy
         self._validate_stream_species()
 
     # ------------------------------------------------------------------
@@ -111,7 +114,15 @@ class PlugFlowSolver:
         total_enthalpy_flow = 0.0
         total_molar_flow = np.zeros(gas.n_species)
         for stream in self.case.streams:
-            stream_flow, stream_enthalpy, molar_flow = _stream_properties(stream, gas, pressure)
+            cleaned_composition = reconcile_feed_with_mechanism(
+                gas,
+                stream.composition,
+                policy=self.feed_compat_policy,
+            )
+            reconciled_stream = replace(stream, composition=cleaned_composition)
+            stream_flow, stream_enthalpy, molar_flow = _stream_properties(
+                reconciled_stream, gas, pressure
+            )
             total_mass_flow += stream_flow
             total_enthalpy_flow += stream_enthalpy
             total_molar_flow += molar_flow
@@ -299,19 +310,17 @@ class PlugFlowSolver:
         return metrics
 
     def _validate_stream_species(self) -> None:
-        missing: Dict[str, float] = {}
-        gas_species = set(self.gas.species_names)
         for stream in self.case.streams:
-            for name, frac in stream.composition.items():
-                if frac <= 0:
-                    continue
-                if name not in gas_species:
-                    missing[name] = missing.get(name, 0.0) + frac
-        if missing:
-            missing_str = ", ".join(sorted(missing))
-            raise ValueError(
-                f"Mechanism {self.gas.name} is missing species required by the case: {missing_str}"
-            )
+            try:
+                reconcile_feed_with_mechanism(
+                    self.gas,
+                    stream.composition,
+                    policy=self.feed_compat_policy,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"Stream '{stream.name}' cannot be reconciled with mechanism {self.gas.name}: {exc}"
+                ) from exc
 
 
 def _stream_properties(
