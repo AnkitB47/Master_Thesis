@@ -8,6 +8,17 @@ from typing import Mapping, Sequence
 import matplotlib.pyplot as plt
 import numpy as np
 
+plt.rcParams["axes.prop_cycle"] = plt.cycler(
+    color=[
+        "#1f77b4",
+        "#ff7f0e",
+        "#2ca02c",
+        "#d62728",
+        "#9467bd",
+        "#8c564b",
+    ]
+)
+
 
 def plot_profile_overlay(
     positions: np.ndarray,
@@ -28,7 +39,9 @@ def plot_profile_overlay(
     ax[0].set_ylabel("Temperature (K)")
     ax[0].legend()
     if ignition_full is not None:
-        ax[0].axvline(ignition_full, color="tab:red", linestyle=":", label="ignition full")
+        ax[0].axvline(
+            ignition_full, color="tab:red", linestyle=":", label="ignition full"
+        )
     if ignition_reduced is not None:
         ax[0].axvline(
             ignition_reduced,
@@ -60,6 +73,32 @@ def plot_profile_overlay(
     plt.close(fig)
 
 
+def plot_progress_variable_overlay(
+    positions_full: np.ndarray,
+    pv_full: np.ndarray,
+    positions_reduced: np.ndarray,
+    pv_reduced: np.ndarray,
+    out_path: Path,
+) -> None:
+    fig, ax = plt.subplots(figsize=(6, 4), dpi=150)
+    ax.plot(positions_full, pv_full, label="full", linewidth=2)
+    ax.plot(
+        positions_reduced,
+        pv_reduced,
+        linestyle="--",
+        marker="o",
+        markersize=3,
+        label="reduced",
+    )
+    ax.set_xlabel("Axial position (m)")
+    ax.set_ylabel("Progress variable")
+    ax.grid(True, alpha=0.3)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
 def plot_profile_residuals(
     positions: np.ndarray,
     residuals: Mapping[str, np.ndarray],
@@ -78,6 +117,27 @@ def plot_profile_residuals(
     plt.close(fig)
 
 
+def plot_timescales_overlay(
+    time_full: np.ndarray,
+    scales_full: Mapping[str, np.ndarray],
+    time_reduced: np.ndarray,
+    scales_reduced: Mapping[str, np.ndarray],
+    out_path: Path,
+) -> None:
+    fig, ax = plt.subplots(figsize=(6, 4), dpi=150)
+    for name, series in scales_full.items():
+        ax.semilogy(time_full, series, label=f"{name} (full)")
+    for name, series in scales_reduced.items():
+        ax.semilogy(time_reduced, series, linestyle="--", label=f"{name} (reduced)")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Timescale (s)")
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend(frameon=False, fontsize=8, ncol=2)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
 def plot_ignition_positions(
     full_position: float | None,
     reduced_position: float | None,
@@ -86,8 +146,10 @@ def plot_ignition_positions(
 ) -> None:
     fig, ax = plt.subplots(figsize=(5, 3), dpi=150)
     xpos = [0, 1]
-    ypos = [full_position if full_position is not None else np.nan,
-            reduced_position if reduced_position is not None else np.nan]
+    ypos = [
+        full_position if full_position is not None else np.nan,
+        reduced_position if reduced_position is not None else np.nan,
+    ]
     ax.scatter(xpos, ypos, s=80)
     ax.set_xticks(xpos)
     ax.set_xticklabels(labels)

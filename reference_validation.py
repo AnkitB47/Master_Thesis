@@ -6,9 +6,11 @@ import argparse
 import json
 from dataclasses import replace
 from pathlib import Path
-from typing import Dict, Sequence
+from typing import Dict, Mapping, Sequence
 
 import pandas as pd
+import numpy as np
+import cantera as ct
 
 from hp_pox import (
     CaseDefinition,
@@ -21,27 +23,70 @@ from hp_pox import (
     load_case_definition,
 )
 from hp_pox.plots import (
+    plot_progress_variable_overlay,
     plot_ignition_positions,
     plot_kpi_summary,
     plot_placeholder,
     plot_profile_overlay,
     plot_profile_residuals,
+    plot_timescales_overlay,
 )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run HP-POX reference validation simulations.")
-    parser.add_argument("--case", default="Case1", help="Benchmark case identifier (Case1–Case4).")
-    parser.add_argument("--mechanism", default="data/gri30.yaml", help="Path to the Cantera mechanism file.")
-    parser.add_argument("--geometry", type=Path, help="Optional geometry JSON override.")
-    parser.add_argument("--heatloss", type=Path, help="Optional heat-loss JSON override.")
-    parser.add_argument("--operating-envelope", type=Path, help="Ignored for reference runs but parsed for completeness.")
-    parser.add_argument("--plant-data", type=Path, help="Optional CSV with experimental plant KPIs for comparison.")
-    parser.add_argument("--friction-factor", type=float, help="Override Darcy friction factor.")
-    parser.add_argument("--plasma", choices=["none", "surrogate_thermal", "surrogate_radical"], default="none")
-    parser.add_argument("--plasma-power", type=float, default=0.0, help="Plasma power for thermal surrogate (W).")
-    parser.add_argument("--plasma-start", type=float, default=0.2, help="Start position of the plasma zone (m).")
-    parser.add_argument("--plasma-end", type=float, default=0.4, help="End position of the plasma zone (m).")
+    parser = argparse.ArgumentParser(
+        description="Run HP-POX reference validation simulations."
+    )
+    parser.add_argument(
+        "--case", default="Case1", help="Benchmark case identifier (Case1–Case4)."
+    )
+    parser.add_argument(
+        "--mechanism",
+        default="data/gri30.yaml",
+        help="Path to the Cantera mechanism file.",
+    )
+    parser.add_argument(
+        "--geometry", type=Path, help="Optional geometry JSON override."
+    )
+    parser.add_argument(
+        "--heatloss", type=Path, help="Optional heat-loss JSON override."
+    )
+    parser.add_argument(
+        "--operating-envelope",
+        type=Path,
+        help="Ignored for reference runs but parsed for completeness.",
+    )
+    parser.add_argument(
+        "--plant-data",
+        type=Path,
+        help="Optional CSV with experimental plant KPIs for comparison.",
+    )
+    parser.add_argument(
+        "--friction-factor", type=float, help="Override Darcy friction factor."
+    )
+    parser.add_argument(
+        "--plasma",
+        choices=["none", "surrogate_thermal", "surrogate_radical"],
+        default="none",
+    )
+    parser.add_argument(
+        "--plasma-power",
+        type=float,
+        default=0.0,
+        help="Plasma power for thermal surrogate (W).",
+    )
+    parser.add_argument(
+        "--plasma-start",
+        type=float,
+        default=0.2,
+        help="Start position of the plasma zone (m).",
+    )
+    parser.add_argument(
+        "--plasma-end",
+        type=float,
+        default=0.4,
+        help="End position of the plasma zone (m).",
+    )
     parser.add_argument(
         "--plasma-radicals",
         default="H:0.02,O:0.01,OH:0.01",
@@ -53,11 +98,27 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Total radical molar flow rate for surrogate injections (kmol/s).",
     )
-    parser.add_argument("--out", type=Path, default=Path("results/reference"), help="Output directory.")
-    parser.add_argument("--points", type=int, default=240, help="Number of axial output points.")
-    parser.add_argument("--ignition-method", choices=["dTdx", "temperature"], default="dTdx")
-    parser.add_argument("--ignition-threshold", type=float, default=150.0, help="Threshold for ignition metric.")
-    parser.add_argument("--ignition-temperature", type=float, default=1300.0, help="Ignition threshold temperature (K).")
+    parser.add_argument(
+        "--out", type=Path, default=Path("results/reference"), help="Output directory."
+    )
+    parser.add_argument(
+        "--points", type=int, default=240, help="Number of axial output points."
+    )
+    parser.add_argument(
+        "--ignition-method", choices=["dTdx", "temperature"], default="dTdx"
+    )
+    parser.add_argument(
+        "--ignition-threshold",
+        type=float,
+        default=150.0,
+        help="Threshold for ignition metric.",
+    )
+    parser.add_argument(
+        "--ignition-temperature",
+        type=float,
+        default=1300.0,
+        help="Ignition threshold temperature (K).",
+    )
     parser.add_argument(
         "--include-wall-heat-loss",
         dest="include_wall_heat_loss",
@@ -106,7 +167,10 @@ def main() -> None:
     plasma = _build_plasma_config(args) if args.plasma != "none" else None
 
     if args.compare_mechanisms:
-        full_mech, reduced_mech = args.compare_mechanisms
+        full_mech, reduced_mech = (
+            _validate_mechanism_path(args.compare_mechanisms[0]),
+            _validate_mechanism_path(args.compare_mechanisms[1]),
+        )
         full_result = _run_simulation(
             full_mech,
             base_case,
@@ -219,7 +283,9 @@ def _export_single_result(mechanism: str, result, out_dir: Path) -> None:
     df.to_csv(out_dir / "profiles.csv", index=False)
     with (out_dir / "metrics.json").open("w", encoding="utf-8") as handle:
         json.dump(result.metrics, handle, indent=2)
-    key_species = [sp for sp in ("CH4", "CO", "H2", "CO2", "H2O") if sp in result.mole_fractions]
+    key_species = [
+        sp for sp in ("CH4", "CO", "H2", "CO2", "H2O") if sp in result.mole_fractions
+    ]
     plot_profile_overlay(
         result.positions_m,
         result.temperature_K,
@@ -230,13 +296,17 @@ def _export_single_result(mechanism: str, result, out_dir: Path) -> None:
         out_path=out_dir / "profiles.png",
         ignition_full=result.metrics.get("ignition_position_m"),
     )
-    plot_placeholder("Residuals require comparison run", out_dir / "profiles_residual.png")
+    plot_placeholder(
+        "Residuals require comparison run", out_dir / "profiles_residual.png"
+    )
     plot_ignition_positions(
         result.metrics.get("ignition_position_m"),
         None,
         out_dir / "ignition_vs_length.png",
     )
-    plot_placeholder("Ignition delay unavailable", out_dir / "ignition_delay_vs_length.png")
+    plot_placeholder(
+        "Ignition delay unavailable", out_dir / "ignition_delay_vs_length.png"
+    )
     plot_placeholder("Run --kpi-sweep to populate", out_dir / "kpis.png")
 
 
@@ -247,8 +317,14 @@ def _export_comparison(
     reduced_result,
     out_dir: Path,
 ) -> None:
-    species = [sp for sp in ("CH4", "CO", "H2", "CO2", "H2O") if sp in full_result.mole_fractions]
-    df = pd.DataFrame({"x_m": full_result.positions_m, "T_full": full_result.temperature_K})
+    species = [
+        sp
+        for sp in ("CH4", "CO", "H2", "CO2", "H2O")
+        if sp in full_result.mole_fractions or sp in reduced_result.mole_fractions
+    ]
+    df = pd.DataFrame(
+        {"x_m": full_result.positions_m, "T_full": full_result.temperature_K}
+    )
     df["T_reduced"] = reduced_result.temperature_K
     for specie in species:
         df[f"X_{specie}_full"] = full_result.mole_fractions.get(specie, 0.0)
@@ -268,23 +344,76 @@ def _export_comparison(
         reduced_result.temperature_K,
         reduced_result.mole_fractions,
         species,
-        out_dir / "profiles.png",
+        out_dir / "overlay_profiles.png",
         ignition_full=full_result.metrics.get("ignition_position_m"),
         ignition_reduced=reduced_result.metrics.get("ignition_position_m"),
     )
     residuals = {}
     for specie in species:
-        residuals[specie] = reduced_result.mole_fractions.get(specie, 0.0) - full_result.mole_fractions.get(
-            specie, 0.0
+        if (
+            specie in full_result.mole_fractions
+            and specie in reduced_result.mole_fractions
+        ):
+            residuals[specie] = np.asarray(
+                reduced_result.mole_fractions[specie]
+            ) - np.asarray(full_result.mole_fractions[specie])
+    if residuals:
+        plot_profile_residuals(
+            full_result.positions_m, residuals, out_dir / "profiles_residual.png"
         )
-    plot_profile_residuals(full_result.positions_m, residuals, out_dir / "profiles_residual.png")
+    else:
+        plot_placeholder(
+            "No overlapping species for residuals", out_dir / "profiles_residual.png"
+        )
     plot_ignition_positions(
         full_result.metrics.get("ignition_position_m"),
         reduced_result.metrics.get("ignition_position_m"),
         out_dir / "ignition_vs_length.png",
+        labels=(Path(full_mech).name, Path(reduced_mech).name),
     )
-    plot_placeholder("Ignition delay requires transient data", out_dir / "ignition_delay_vs_length.png")
-    plot_placeholder("Run --kpi-sweep to generate KPIs", out_dir / "kpis.png")
+    plot_placeholder(
+        "Ignition delay requires transient data",
+        out_dir / "ignition_delay_vs_length.png",
+    )
+    kpi_rows = []
+    for label, mech, result in (
+        ("full", full_mech, full_result),
+        ("reduced", reduced_mech, reduced_result),
+    ):
+        row = {"label": label, "mechanism": mech}
+        row.update(result.metrics)
+        row.update(_compute_kpis(result))
+        kpi_rows.append(row)
+    pd.DataFrame(kpi_rows).to_csv(out_dir / "kpis.csv", index=False)
+    plot_placeholder("See kpis.csv for KPI comparison", out_dir / "kpis.png")
+    pv_full = _extract_progress_variable(full_result)
+    pv_reduced = _extract_progress_variable(reduced_result)
+    if pv_full and pv_reduced:
+        plot_progress_variable_overlay(
+            pv_full[0],
+            pv_full[1],
+            pv_reduced[0],
+            pv_reduced[1],
+            out_dir / "pv_overlay.png",
+        )
+    else:
+        plot_placeholder(
+            "Progress variable diagnostics unavailable", out_dir / "pv_overlay.png"
+        )
+    times_full = _extract_timescales(full_result)
+    times_reduced = _extract_timescales(reduced_result)
+    if times_full and times_reduced:
+        plot_timescales_overlay(
+            times_full[0],
+            times_full[1],
+            times_reduced[0],
+            times_reduced[1],
+            out_dir / "timescales.png",
+        )
+    else:
+        plot_placeholder(
+            "Timescale diagnostics unavailable", out_dir / "timescales.png"
+        )
 
 
 def _run_kpi_sweep(
@@ -299,7 +428,9 @@ def _run_kpi_sweep(
     results = []
     for pressure in pressures_bar:
         for target_T in temperatures_K:
-            modified_case = replace(case, pressure_bar=pressure, target_temperature_K=target_T)
+            modified_case = replace(
+                case, pressure_bar=pressure, target_temperature_K=target_T
+            )
             sim_result = _run_simulation(mechanism, modified_case, args, plasma)
             metrics = _compute_kpis(sim_result)
             metrics.update({"pressure_bar": pressure, "target_T_K": target_T})
@@ -312,13 +443,22 @@ def _run_kpi_sweep(
             "Cold gas efficiency": list(df["cold_gas_efficiency"]),
             "(CO+H2)/NG LHV": list(df["lhv_ratio"]),
         }
-        plot_kpi_summary(range(len(df)), summary_values, out_dir / "kpis.png", "Sweep index")
-        for sweep, label in [("pressure_bar", "Pressure (bar)"), ("target_T_K", "Outlet temperature (K)")]:
+        plot_kpi_summary(
+            range(len(df)), summary_values, out_dir / "kpis.png", "Sweep index"
+        )
+        for sweep, label in [
+            ("pressure_bar", "Pressure (bar)"),
+            ("target_T_K", "Outlet temperature (K)"),
+        ]:
             grouped = df.groupby(sweep)
             positions = list(grouped.groups.keys())
             values = {
-                "HC conversion": [group["hc_conversion"].mean() for _, group in grouped],
-                "Cold gas efficiency": [group["cold_gas_efficiency"].mean() for _, group in grouped],
+                "HC conversion": [
+                    group["hc_conversion"].mean() for _, group in grouped
+                ],
+                "Cold gas efficiency": [
+                    group["cold_gas_efficiency"].mean() for _, group in grouped
+                ],
                 "(CO+H2)/NG LHV": [group["lhv_ratio"].mean() for _, group in grouped],
             }
             plot_kpi_summary(positions, values, out_dir / f"kpis_{sweep}.png", label)
@@ -345,6 +485,64 @@ def _compute_kpis(result) -> Dict[str, float]:
         "cold_gas_efficiency": cold_gas_eff,
         "lhv_ratio": lhv_ratio,
     }
+
+
+def _validate_mechanism_path(path: str) -> str:
+    candidate = Path(path)
+    if not candidate.exists():
+        raise SystemExit(f"Mechanism file not found: {path}")
+    try:
+        ct.Solution(str(candidate))
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(f"Failed to load mechanism '{path}': {exc}") from exc
+    return str(candidate)
+
+
+def _extract_progress_variable(result) -> tuple[np.ndarray, np.ndarray] | None:
+    meta = (
+        result.metadata.get("progress_variable")
+        if hasattr(result, "metadata")
+        else None
+    )
+    if meta is None:
+        return None
+    if isinstance(meta, Mapping):
+        values = meta.get("values")
+        positions = meta.get("positions") or meta.get("time")
+    elif isinstance(meta, (tuple, list)) and len(meta) == 2:
+        positions, values = meta
+    else:
+        return None
+    if values is None:
+        return None
+    values_arr = np.asarray(values)
+    if positions is None:
+        positions_arr = np.linspace(0.0, 1.0, values_arr.size)
+    else:
+        positions_arr = np.asarray(positions)
+    if positions_arr.size != values_arr.size:
+        return None
+    return positions_arr, values_arr
+
+
+def _extract_timescales(result) -> tuple[np.ndarray, Dict[str, np.ndarray]] | None:
+    meta = result.metadata.get("timescales") if hasattr(result, "metadata") else None
+    if meta is None or not isinstance(meta, Mapping):
+        return None
+    time = meta.get("time") or meta.get("positions")
+    if time is None:
+        return None
+    time_arr = np.asarray(time)
+    series: Dict[str, np.ndarray] = {}
+    for key, value in meta.items():
+        if key in {"time", "positions"}:
+            continue
+        arr = np.asarray(value)
+        if arr.shape == time_arr.shape:
+            series[key] = arr
+    if not series:
+        return None
+    return time_arr, series
 
 
 if __name__ == "__main__":

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Mapping, Sequence
 
 import json
+import logging
 import time
 
 import numpy as np
@@ -17,8 +19,8 @@ import cantera as ct
 from metaheuristics.ga import GAOptions, run_ga
 
 from .configuration import load_case_definition
+from .plasma import PlasmaSurrogateConfig
 from .pfr import PlugFlowOptions, PlugFlowResult, PlugFlowSolver
-import logging
 
 
 @dataclass
@@ -121,7 +123,8 @@ class GAGNNReducer:
         elapsed = time.perf_counter() - start
         best_score, best_details = self._evaluate_individual(best)
         best_metrics = {
-            case: data["metrics"] for case, data in best_details.get("cases", {}).items()
+            case: data["metrics"]
+            for case, data in best_details.get("cases", {}).items()
         }
         self._export_results(best, history, debug, best_details, elapsed)
         return ReductionResult(
@@ -135,7 +138,9 @@ class GAGNNReducer:
         )
 
     # ------------------------------------------------------------------
-    def _evaluate_individual(self, genome: np.ndarray) -> tuple[float, Dict[str, object]]:
+    def _evaluate_individual(
+        self, genome: np.ndarray
+    ) -> tuple[float, Dict[str, object]]:
         try:
             details = self._solve_for_genome(genome)
         except Exception as exc:  # noqa: BLE001
@@ -144,55 +149,30 @@ class GAGNNReducer:
         return score, details
 
     def _solve_for_genome(self, genome: np.ndarray) -> Dict[str, object]:
-        active_species = [name for i, name in enumerate(self.species_names) if genome[i] > 0.5]
+        active_species = [
+            name for i, name in enumerate(self.species_names) if genome[i] > 0.5
+        ]
         missing = self.required_species.difference(active_species)
         if missing:
             raise ValueError(f"Genome removed required species: {sorted(missing)}")
-        allowed = set(active_species)
-        reactions_data = [
-            rxn.input_data
-            for rxn in self.mechanism.reactions()
-            if set(rxn.reactants).issubset(allowed) and set(rxn.products).issubset(allowed)
-        ]
-        if not reactions_data:
+        reduced_gas = self._solution_from_genome(genome)
+        reactions = list(reduced_gas.reactions())
+        if not reactions:
             raise ValueError("Genome eliminated all reactions")
-        penalty = self._reaction_penalty(reactions_data)
-        options = PlugFlowOptions(output_points=self.config.sample_points)
-        case_results: Dict[str, Dict[str, object]] = {}
-        total_error = penalty
-        for case in self.reference_cases:
-            species_objects = [
-                ct.Species.from_dict(self.mechanism.species(name).input_data)
-                for name in active_species
-            ]
-            reduced_gas = ct.Solution(
-                thermo="IdealGas",
-                kinetics="GasKinetics",
-                species=species_objects,
-                reactions=[ct.Reaction.from_dict(data) for data in reactions_data],
-            )
-            solver = PlugFlowSolver(
-                reduced_gas,
-                case,
-                options=options,
-            )
-            result = solver.solve()
-            errors = self._compare_profiles(case.name, result)
-            total_error += errors["total"]
-            case_results[case.name] = {
-                "metrics": result.metrics,
-                "errors": errors,
-                "species": active_species,
-            }
+        penalty = self._reaction_penalty(reactions)
+        case_results, case_error = self._metrics_for_genome(reduced_gas, active_species)
+        total_error = penalty + case_error
         return {
             "cases": case_results,
             "penalty": penalty,
             "total_error": total_error,
             "active_species": active_species,
-            "reactions": len(reactions_data),
+            "reactions": len(reactions),
         }
 
-    def _compare_profiles(self, case_name: str, candidate: PlugFlowResult) -> Dict[str, object]:
+    def _compare_profiles(
+        self, case_name: str, candidate: PlugFlowResult
+    ) -> Dict[str, object]:
         baseline = self.reference_profiles[case_name]
         xs = baseline.positions_m
         masks = self._region_masks(xs, baseline.metrics.get("ignition_position_m"))
@@ -223,7 +203,9 @@ class GAGNNReducer:
             if candidate_ign is None:
                 ignition_penalty = 1.0
             else:
-                ignition_penalty = abs(candidate_ign - baseline_ign) / max(baseline_ign, 1e-6)
+                ignition_penalty = abs(candidate_ign - baseline_ign) / max(
+                    baseline_ign, 1e-6
+                )
         total += ignition_penalty
         return {
             "temperature": temp_errors,
@@ -232,7 +214,9 @@ class GAGNNReducer:
             "total": total,
         }
 
-    def _region_masks(self, xs: np.ndarray, ignition: float | None) -> Dict[str, np.ndarray]:
+    def _region_masks(
+        self, xs: np.ndarray, ignition: float | None
+    ) -> Dict[str, np.ndarray]:
         length = xs[-1] - xs[0]
         step = length / max(len(xs) - 1, 1)
         window = max(0.02 * length, step)
@@ -257,8 +241,8 @@ class GAGNNReducer:
                 post[-1] = True
         return {"pre": pre, "ignition": ign, "post": post}
 
-    def _reaction_penalty(self, reactions: Sequence[Mapping[str, object]]) -> float:
-        equations = {reaction["equation"] for reaction in reactions if "equation" in reaction}
+    def _reaction_penalty(self, reactions: Sequence[ct.Reaction]) -> float:
+        equations = {getattr(reaction, "equation", "") for reaction in reactions}
         missing = [
             pattern
             for pattern, matches in self.required_reaction_patterns.items()
@@ -268,14 +252,15 @@ class GAGNNReducer:
 
     def _compute_reference_profiles(self) -> Dict[str, PlugFlowResult]:
         profiles: Dict[str, PlugFlowResult] = {}
-        options = PlugFlowOptions(output_points=self.config.sample_points)
         for case in self.reference_cases:
-            solver = PlugFlowSolver(self.mechanism, case, options)
+            solver = self._reactive_solver(self.mechanism, case)
             profiles[case.name] = solver.solve()
         return profiles
 
     def _collect_baseline_metrics(self) -> Dict[str, Mapping[str, float]]:
-        return {name: result.metrics for name, result in self.reference_profiles.items()}
+        return {
+            name: result.metrics for name, result in self.reference_profiles.items()
+        }
 
     def _determine_fixed_species(self) -> Sequence[str]:
         essential = set(self.required_species)
@@ -286,35 +271,80 @@ class GAGNNReducer:
                 essential.update(stream.composition.keys())
         return [name for name in essential if name in self.species_names]
 
+    def _metrics_for_genome(
+        self, gas: ct.Solution, active_species: Sequence[str]
+    ) -> tuple[Dict[str, Dict[str, object]], float]:
+        case_results: Dict[str, Dict[str, object]] = {}
+        total_error = 0.0
+        for case in self.reference_cases:
+            solver = self._reactive_solver(gas, case)
+            result = solver.solve()
+            errors = self._compare_profiles(case.name, result)
+            total_error += errors["total"]
+            case_results[case.name] = {
+                "metrics": result.metrics,
+                "errors": errors,
+                "species": list(active_species),
+            }
+        return case_results, total_error
+
+    def _reactive_solver(
+        self, mechanism: ct.Solution | str | Path, case
+    ) -> PlugFlowSolver:
+        mech_obj = mechanism
+        if isinstance(mechanism, ct.Solution):
+            mech_obj = deepcopy(mechanism)
+        options = PlugFlowOptions(
+            output_points=self.config.sample_points,
+            ignition_method="temperature",
+            ignition_temperature_K=1300.0,
+        )
+        plasma = PlasmaSurrogateConfig(
+            mode="thermal",
+            start_position_m=0.05,
+            end_position_m=0.25,
+            plasma_power_W=2.5e5,
+        )
+        return PlugFlowSolver(
+            mech_obj,
+            case,
+            options=options,
+            plasma=plasma,
+        )
+
     def _solution_from_genome(self, genome: np.ndarray) -> ct.Solution:
-        active_species = [self.species_names[i] for i in range(len(self.species_names)) if genome[i] > 0.5]
-        allowed = set(active_species)
-        species_objects = [
-            ct.Species.from_dict(self.mechanism.species(name).input_data)
-            for name in active_species
+        allowed_names = [
+            name for i, name in enumerate(self.species_names) if genome[i] > 0.5
         ]
+        if not allowed_names:
+            raise ValueError("No species selected")
+
+        species_objects = [
+            deepcopy(sp) for sp in self.mechanism.species() if sp.name in allowed_names
+        ]
+        allowed = {sp.name for sp in species_objects}
+
         reactions: List[ct.Reaction] = []
         for rxn in self.mechanism.reactions():
-            if not (
-                set(rxn.reactants).issubset(allowed)
-                and set(rxn.products).issubset(allowed)
-            ):
+            reactant_set = set(rxn.reactants)
+            product_set = set(rxn.products)
+            if not (reactant_set.issubset(allowed) and product_set.issubset(allowed)):
                 continue
-            try:
-                reactions.append(rxn)
-            except Exception as exc:  # noqa: BLE001
-                self.logger.warning(
-                    "Failed to create reaction %s: %s",
-                    getattr(rxn, "equation", "<unknown>"),
-                    exc,
-                )
-                continue
-        return ct.Solution(
-            thermo="IdealGas",
-            kinetics="GasKinetics",
+            r2 = deepcopy(rxn)
+            if hasattr(r2, "third_body") and r2.third_body is not None:
+                efficiencies = r2.third_body.efficiencies or {}
+                r2.third_body.efficiencies = {
+                    sp: eff for sp, eff in efficiencies.items() if sp in allowed
+                }
+            reactions.append(r2)
+
+        gas_red = ct.Solution(
+            thermo=self.mechanism.thermo.model,
+            kinetics=self.mechanism.kinetics.model,
             species=species_objects,
             reactions=reactions,
         )
+        return gas_red
 
     def _load_seed_population(self) -> np.ndarray:
         if self.config.gnn_seed_path is None:
@@ -325,7 +355,11 @@ class GAGNNReducer:
         scores = pd.read_csv(path)
         species_to_idx = {name: i for i, name in enumerate(self.species_names)}
         ranked = sorted(
-            ((species_to_idx[row["species"]], row["score"]) for _, row in scores.iterrows() if row["species"] in species_to_idx),
+            (
+                (species_to_idx[row["species"]], row["score"])
+                for _, row in scores.iterrows()
+                if row["species"] in species_to_idx
+            ),
             key=lambda item: item[1],
             reverse=True,
         )
@@ -356,7 +390,8 @@ class GAGNNReducer:
         with (out_dir / "baseline_metrics.json").open("w", encoding="utf-8") as handle:
             json.dump(self.baseline_metrics, handle, indent=2)
         best_metrics = {
-            case: data["metrics"] for case, data in best_details.get("cases", {}).items()
+            case: data["metrics"]
+            for case, data in best_details.get("cases", {}).items()
         }
         with (out_dir / "best_metrics.json").open("w", encoding="utf-8") as handle:
             json.dump(best_metrics, handle, indent=2)
@@ -371,7 +406,32 @@ class GAGNNReducer:
         mechanism_name = Path(self.config.mechanism).stem
         reduced_solution = self._solution_from_genome(best)
         yaml_path = out_dir / f"{mechanism_name}_reduced.yaml"
-        reduced_solution.write_yaml(str(yaml_path))
+        try:
+            reduced_solution.write_yaml(str(yaml_path), header="# Reduced by GA+GNN")
+        except Exception as exc:  # noqa: BLE001
+            import yaml
+
+            doc = {
+                "phases": [
+                    {
+                        "name": "gas",
+                        "thermo": reduced_solution.thermo.model,
+                        "kinetics": reduced_solution.kinetics.model,
+                        "elements": [e.symbol for e in self.mechanism.elements()],
+                        "species": [sp.name for sp in reduced_solution.species()],
+                        "state": {"T": 300.0, "P": "1 atm"},
+                    }
+                ],
+                "species": [
+                    yaml.safe_load(sp.to_yaml()) for sp in reduced_solution.species()
+                ],
+                "reactions": [
+                    yaml.safe_load(r.to_yaml()) for r in reduced_solution.reactions()
+                ],
+            }
+            with open(yaml_path, "w", encoding="utf-8") as handle:
+                yaml.safe_dump(doc, handle, sort_keys=False)
+            self.logger.warning("write_yaml failed (%s); used manual YAML export", exc)
         with (out_dir / "best_details.json").open("w", encoding="utf-8") as handle:
             json.dump(_serialize_details(best_details), handle, indent=2)
 
